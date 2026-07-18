@@ -24,10 +24,11 @@ class ModelConfig:
     max_context: int = 32
     num_actions: int = 121
     dropout: float = 0.1
+    prediction_objective: str = "mse"
 
     def __post_init__(self) -> None:
-        if self.observation_mode not in {"terminal", "pixels"}:
-            raise ValueError("observation_mode must be 'terminal' or 'pixels'")
+        if self.observation_mode not in {"terminal", "terminal_rgb", "pixels"}:
+            raise ValueError("observation_mode must be 'terminal', 'terminal_rgb', or 'pixels'")
         if self.latent_dim % self.predictor_heads:
             raise ValueError("latent_dim must be divisible by predictor_heads")
         if self.vit_dim % self.vit_heads:
@@ -38,6 +39,8 @@ class ModelConfig:
             raise ValueError("patch sizes and max_patches must be positive")
         if self.max_context < 1:
             raise ValueError("max_context must be positive")
+        if self.prediction_objective not in {"mse", "flow"}:
+            raise ValueError("prediction_objective must be 'mse' or 'flow'")
 
 
 @dataclass(frozen=True)

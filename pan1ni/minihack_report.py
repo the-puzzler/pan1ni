@@ -23,23 +23,22 @@ from .train import move_batch, pretrain_step
 STAGE_NAMES = {0: "find key", 1: "reach locked door", 2: "enter goal room", 3: "reach staircase"}
 
 
-def pixel_model_config() -> ModelConfig:
-    return ModelConfig(
-        observation_mode="pixels",
-        latent_dim=64,
-        hidden_dim=64,
-        vit_dim=64,
-        vit_layers=1,
-        vit_heads=4,
-        pixel_patch_size=16,
-        max_patches=128,
-        projector_hidden_dim=128,
-        predictor_layers=1,
-        predictor_heads=4,
-        max_context=4,
-        num_actions=10,
-        dropout=0.0,
-    )
+def pixel_model_config(scale: str = "small") -> ModelConfig:
+    if scale == "small":
+        return ModelConfig(
+            observation_mode="pixels", latent_dim=64, hidden_dim=64,
+            vit_dim=64, vit_layers=1, vit_heads=4, pixel_patch_size=16,
+            max_patches=128, projector_hidden_dim=128, predictor_layers=1,
+            predictor_heads=4, max_context=4, num_actions=10, dropout=0.0,
+        )
+    if scale == "medium":
+        return ModelConfig(
+            observation_mode="pixels", latent_dim=256, hidden_dim=256,
+            vit_dim=128, vit_layers=4, vit_heads=8, pixel_patch_size=16,
+            max_patches=128, projector_hidden_dim=512, predictor_layers=4,
+            predictor_heads=8, max_context=4, num_actions=10, dropout=0.0,
+        )
+    raise ValueError(f"unknown pixel model scale: {scale}")
 
 
 def _render_frame(pixels, label: str) -> Image.Image:
@@ -186,6 +185,7 @@ def run_report(
     device: str,
     num_workers: int = 0,
     prefetch_factor: int = 2,
+    model_scale: str = "small",
 ) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(0)
@@ -216,7 +216,8 @@ def run_report(
         move_batch(batch, device, non_blocking=use_cuda)
         for batch in DataLoader(validation_data, batch_size=batch_size, **loader_options)
     ]
-    model = GoalConditionedLeWorldModel(pixel_model_config()).to(device)
+    model_config = pixel_model_config(model_scale)
+    model = GoalConditionedLeWorldModel(model_config).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     timeline = [{"step": 0, "diagnostics": diagnose(model, validation_batches)}]
     started = time.perf_counter()
@@ -245,15 +246,24 @@ def run_report(
                 f"rank {diagnostic['latent_effective_rank']:.2f}",
                 flush=True,
             )
+            torch.save(
+                {"model": model.state_dict(), "config": asdict(model_config), "step": step},
+                output / "checkpoint.pt",
+            )
     if device.startswith("cuda"):
         torch.cuda.synchronize()
     elapsed = time.perf_counter() - started
-    torch.save({"model": model.state_dict(), "config": asdict(pixel_model_config())}, output / "checkpoint.pt")
+    torch.save(
+        {"model": model.state_dict(), "config": asdict(model_config), "step": steps},
+        output / "checkpoint.pt",
+    )
     media = render_media(data_path, output)
     payload = {
         "generated_at": time.strftime("%Y-%m-%d %H:%M:%S %Z"),
         "config": {
             "steps": steps,
+            "model_scale": model_scale,
+            "model_parameters": sum(parameter.numel() for parameter in model.parameters()),
             "batch_size": batch_size,
             "training_windows": steps * batch_size,
             "sigreg_slices": sigreg_slices,
@@ -285,6 +295,7 @@ def main() -> None:
     parser.add_argument("--validation-samples", type=int, default=64)
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument("--model-scale", choices=("small", "medium"), default="small")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     path = run_report(
@@ -292,6 +303,7 @@ def main() -> None:
         sigreg_slices=args.sigreg_slices, eval_every=args.eval_every,
         validation_samples=args.validation_samples, device=args.device,
         num_workers=args.num_workers, prefetch_factor=args.prefetch_factor,
+        model_scale=args.model_scale,
     )
     print(path)
 

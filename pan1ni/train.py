@@ -44,11 +44,12 @@ def pretrain_step(
     sigreg_weight: float = 0.1,
     sigreg_slices: int = 256,
     grad_clip_norm: float = 1.0,
+    objective: str = "mse",
 ) -> dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
-    # As in the LeJEPA multi-view encoder, all views pass through the CLS
-    # projector together. BatchNorm therefore operates over batch × views.
+    # Match LeWorldModel: real temporal states (history + target) share the
+    # batch x time projector call, while the goal is encoded separately.
     grouped_latents = model.encode_group(
         _observation(batch, "history"),
         _observation(batch, "goal"),
@@ -57,11 +58,33 @@ def pretrain_step(
     history_latents = grouped_latents[:, :-2]
     goal_z = grouped_latents[:, -2]
     target_latent = grouped_latents[:, -1]
-    output = model.predict_latents(history_latents, goal_z)
+    temporal_latents = torch.cat((history_latents, target_latent[:, None]), dim=1)
+    targets = temporal_latents[:, 1:]
+    if objective == "mse":
+        predictions, _ = model.predict_sequence_latents(temporal_latents[:, :-1], goal_z)
+        prediction_targets = targets
+    elif objective == "flow":
+        source_noise = torch.randn_like(targets)
+        flow_times = torch.rand(
+            *targets.shape[:-1],
+            1,
+            device=targets.device,
+            dtype=targets.dtype,
+        )
+        interpolated = (1 - flow_times) * source_noise + flow_times * targets
+        predictions, _ = model.predict_flow_sequence(
+            temporal_latents[:, :-1],
+            goal_z,
+            interpolated,
+            flow_times,
+        )
+        prediction_targets = targets - source_noise
+    else:
+        raise ValueError("objective must be 'mse' or 'flow'")
     losses = pretraining_loss(
-        output.next_latent,
-        target_latent,
-        grouped_latents.transpose(0, 1),
+        predictions,
+        prediction_targets,
+        temporal_latents.transpose(0, 1),
         sigreg_weight=sigreg_weight,
         sigreg_slices=sigreg_slices,
     )

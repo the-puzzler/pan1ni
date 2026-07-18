@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "h5py>=3.14.0",
+    "matplotlib>=3.11.1",
     "minihack>=1.0.2",
     "nle>=1.3.0",
     "pillow>=11.0.0",

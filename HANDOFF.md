@@ -172,3 +172,23 @@ For substantial NLD-NAO human data as well, prefer 1 TB local NVMe.
 5. Start the batch-512 medium run.
 6. Monitor GPU, CPU, RAM, throughput, and checkpoint output.
 7. Check disk capacity before downloading any full NLD shards.
+
+## Planned experiment after the RGB MSE baseline
+
+Do not replace or interrupt the current MSE experiment for this. After it has
+finished, train a goal-conditioned flow-matching version on the same encoded
+next-state targets:
+
+- draw a source/noise latent and interpolate it with the true encoded next
+  state at a sampled flow time;
+- train the predictor as a conditional flow/denoising field using history and
+  the randomly sampled future goal embedding;
+- at inference, take exactly **one denoising/flow step** rather than integrating
+  a full trajectory or producing many next-state samples;
+- use the **predicted residual flow from that one step as the action-decoder
+  features**;
+- compare this action probe directly against the MSE predictor-feature baseline.
+
+This one-step residual-flow feature strategy is intentional and user-validated
+from prior experiments. Do not silently reinterpret it as full ODE sampling or
+multi-step diffusion inference.

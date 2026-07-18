@@ -124,7 +124,11 @@ class NLDHDF5GoalDataset(Dataset[dict[str, Tensor | dict[str, Tensor]]]):
         previous = self.cumulative_windows[episode_index - 1] if episode_index else 0
         offset = flat_window - previous
         t = self.context_length - 1 + offset
-        goal_t = t + self.goal_horizon
+        # Sample a genuinely future goal rather than fixing every example at
+        # the maximum horizon. Keep it beyond t+1 so the goal cannot equal the
+        # one-step prediction target.
+        goal_offset = rng.randint(2, self.goal_horizon) if self.goal_horizon > 1 else 1
+        goal_t = t + goal_offset
         key = self.episode_keys[episode_index]
         group = self.handle[key]
         start = t - self.context_length + 1
@@ -133,7 +137,7 @@ class NLDHDF5GoalDataset(Dataset[dict[str, Tensor | dict[str, Tensor]]]):
             "target": self._observation(group, t + 1),
             "goal": self._observation(group, goal_t),
             "action": torch.tensor(group["actions"][t], dtype=torch.long),
-            "goal_offset": torch.tensor(self.goal_horizon, dtype=torch.long),
+            "goal_offset": torch.tensor(goal_offset, dtype=torch.long),
             "timestep": torch.tensor(t, dtype=torch.long),
             "trajectory_id": torch.tensor(int(key), dtype=torch.long),
         }
@@ -192,12 +196,21 @@ class NLDTtyrecGoalBatchStream:
         )
         return sorted(dataset._gameids)
 
-    def _observation(self, raw: dict, index: int | slice) -> dict[str, Tensor]:
-        chars = torch.from_numpy(raw["tty_chars"][:, index].copy()).long()
-        colors = torch.from_numpy(raw["tty_colors"][:, index].copy()).long()
-        cursor = torch.from_numpy(raw["tty_cursor"][:, index].copy()).long()
+    def _observation(self, raw: dict, index: int | slice | np.ndarray) -> dict[str, Tensor]:
+        # Keep ttyrec fields in their compact on-disk dtypes. The encoder casts
+        # them on the GPU immediately before embedding. Expanding chars/colors
+        # to int64 here inflated both host work and PCIe traffic by up to 8x.
+        def take(name: str) -> np.ndarray:
+            values = raw[name]
+            if isinstance(index, np.ndarray):
+                return values[np.arange(values.shape[0]), index].copy()
+            return values[:, index].copy()
+
+        chars = torch.from_numpy(take("tty_chars"))
+        colors = torch.from_numpy(take("tty_colors"))
+        cursor = torch.from_numpy(take("tty_cursor"))
         leading_shape = chars.shape[:-2]
-        message = torch.zeros(*leading_shape, self.message_length, dtype=torch.long)
+        message = torch.zeros(*leading_shape, self.message_length, dtype=chars.dtype)
         width = min(chars.shape[-1], self.message_length)
         message[..., :width] = chars[..., 0, :width]
         return {
@@ -248,17 +261,29 @@ class NLDTtyrecGoalBatchStream:
                         continue
                     batch = {name: value[valid] for name, value in raw.items()}
                     current = offset + self.context_length - 1
+                    batch_size = int(valid.sum())
+                    minimum_goal_offset = 2 if self.goal_horizon > 1 else 1
+                    goal_offsets = rng.integers(
+                        minimum_goal_offset,
+                        self.goal_horizon + 1,
+                        size=batch_size,
+                    )
                     yield {
+                        **(
+                            {
+                                "action": torch.from_numpy(
+                                    batch["keypresses"][:, current].copy()
+                                ).long()
+                            }
+                            if "keypresses" in batch
+                            else {}
+                        ),
                         "history": self._observation(
                             batch, slice(offset, offset + self.context_length)
                         ),
                         "target": self._observation(batch, current + 1),
-                        "goal": self._observation(
-                            batch, current + self.goal_horizon
-                        ),
-                        "goal_offset": torch.full(
-                            (int(valid.sum()),), self.goal_horizon, dtype=torch.long
-                        ),
+                        "goal": self._observation(batch, current + goal_offsets),
+                        "goal_offset": torch.from_numpy(goal_offsets.copy()).long(),
                         "trajectory_id": torch.from_numpy(
                             batch["gameids"][:, current].copy()
                         ).long(),
@@ -266,6 +291,59 @@ class NLDTtyrecGoalBatchStream:
                             batch["timestamps"][:, current].copy()
                         ).long(),
                     }
+
+
+def prefetch_streams(
+    sources: Sequence[Iterator[dict[str, Tensor | dict[str, Tensor]]]],
+    depth: int,
+) -> Iterator[dict[str, Tensor | dict[str, Tensor]]]:
+    """Merge independently decoded streams through one bounded queue."""
+
+    if not sources or depth < 1:
+        raise ValueError("sources and depth must be non-empty and positive")
+    queue: Queue = Queue(maxsize=depth)
+    sentinel = object()
+    stopped = Event()
+
+    def put(item: object) -> bool:
+        while not stopped.is_set():
+            try:
+                queue.put(item, timeout=0.1)
+                return True
+            except Full:
+                pass
+        return False
+
+    def produce(source: Iterator) -> None:
+        try:
+            for batch in source:
+                if not put(batch):
+                    break
+        except BaseException as error:
+            put(error)
+        finally:
+            put(sentinel)
+
+    workers = [
+        Thread(target=produce, args=(source,), name=f"nld-ttyrec-prefetch-{index}", daemon=True)
+        for index, source in enumerate(sources)
+    ]
+    for worker in workers:
+        worker.start()
+    remaining = len(workers)
+    try:
+        while remaining:
+            item = queue.get()
+            if item is sentinel:
+                remaining -= 1
+            elif isinstance(item, BaseException):
+                raise item
+            else:
+                yield item
+    finally:
+        stopped.set()
+        for worker in workers:
+            worker.join(timeout=5)
 
 
 def prefetch_batches(

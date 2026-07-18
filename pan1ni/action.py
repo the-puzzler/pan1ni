@@ -19,9 +19,21 @@ class InverseDynamicsHead(nn.Module):
 
 
 class DirectPolicyHead(nn.Module):
-    def __init__(self, latent_dim: int, num_actions: int, hidden_dim: int = 256) -> None:
+    def __init__(
+        self,
+        latent_dim: int,
+        num_actions: int,
+        hidden_dim: int = 256,
+        hidden_layers: int = 1,
+    ) -> None:
         super().__init__()
-        self.network = nn.Sequential(nn.Linear(latent_dim, hidden_dim), nn.GELU(), nn.Linear(hidden_dim, num_actions))
+        if hidden_layers < 1:
+            raise ValueError("hidden_layers must be positive")
+        layers: list[nn.Module] = [nn.Linear(latent_dim, hidden_dim), nn.GELU()]
+        for _ in range(hidden_layers - 1):
+            layers.extend((nn.Linear(hidden_dim, hidden_dim), nn.GELU()))
+        layers.append(nn.Linear(hidden_dim, num_actions))
+        self.network = nn.Sequential(*layers)
 
     def forward(self, predictor_hidden: Tensor) -> Tensor:
         return self.network(predictor_hidden)

@@ -45,12 +45,17 @@ OBJECT:('(',"skeleton key"),({key_position[0]},{key_position[1]}),blessed,0
 KEYROOM_DES = keyroom_des(KEY_POSITIONS[0], GOAL_POSITIONS[0])
 MOVES = ((0, -1), (1, 0), (0, 1), (-1, 0), (1, -1), (1, 1), (-1, 1), (-1, -1))
 CARDINAL_MOVES = MOVES[:4]
-OBSERVATION_KEYS = ("screen_descriptions", "blstats", "message", "pixel_crop")
+OBSERVATION_KEYS = (
+    "screen_descriptions", "blstats", "message", "pixel_crop",
+    "tty_chars", "tty_colors", "tty_cursor",
+)
 
 
 @dataclass
 class KeyRoomEpisode:
     pixels: np.ndarray
+    tty_chars: np.ndarray
+    tty_colors: np.ndarray
     actions: np.ndarray
     positions: np.ndarray
     stages: np.ndarray
@@ -154,6 +159,8 @@ class KeyRoomOracle:
         self.env = env
         self.observation: dict = {}
         self.pixels: list[np.ndarray] = []
+        self.tty_chars: list[np.ndarray] = []
+        self.tty_colors: list[np.ndarray] = []
         self.actions: list[int] = []
         self.positions: list[tuple[int, int]] = []
         self.stages: list[int] = []
@@ -164,6 +171,8 @@ class KeyRoomOracle:
     def _record_initial(self, observation: dict) -> None:
         self.observation = observation
         self.pixels = [observation["pixel_crop"].copy()]
+        self.tty_chars = [observation["tty_chars"].copy()]
+        self.tty_colors = [observation["tty_colors"].copy()]
         self.actions = []
         self.positions = [_position(observation)]
         self.stages = [0]
@@ -177,6 +186,8 @@ class KeyRoomOracle:
         self.observation = observation
         self.actions.append(action)
         self.pixels.append(observation["pixel_crop"].copy())
+        self.tty_chars.append(observation["tty_chars"].copy())
+        self.tty_colors.append(observation["tty_colors"].copy())
         self.positions.append(_position(observation))
         self.stages.append(stage)
         self.total_reward += float(reward)
@@ -253,6 +264,8 @@ class KeyRoomOracle:
         # repeated player sprites), so end each demonstration on the last valid
         # frame immediately before descending the staircase.
         self.pixels.pop()
+        self.tty_chars.pop()
+        self.tty_colors.pop()
         self.positions.pop()
         self.stages.pop()
         self.actions.pop()
@@ -260,6 +273,8 @@ class KeyRoomOracle:
 
         return KeyRoomEpisode(
             pixels=np.stack(self.pixels),
+            tty_chars=np.stack(self.tty_chars),
+            tty_colors=np.stack(self.tty_colors),
             actions=np.asarray(self.actions, dtype=np.int16),
             positions=np.asarray(self.positions, dtype=np.int16),
             stages=np.asarray(self.stages, dtype=np.int8),
@@ -298,6 +313,8 @@ def collect_keyroom_dataset(
                 episode = KeyRoomOracle(envs[variant_index]).collect()
                 group = handle.create_group(str(episode_index))
                 group.create_dataset("pixels", data=episode.pixels, compression="gzip", compression_opts=1)
+                group.create_dataset("tty_chars", data=episode.tty_chars, compression="gzip", compression_opts=1)
+                group.create_dataset("tty_colors", data=episode.tty_colors, compression="gzip", compression_opts=1)
                 group.create_dataset("actions", data=episode.actions)
                 group.create_dataset("positions", data=episode.positions)
                 group.create_dataset("stages", data=episode.stages)

@@ -52,6 +52,8 @@ def report_model_config() -> ModelConfig:
 def diagnose(
     model: GoalConditionedLeWorldModel,
     batches: Iterable[Mapping],
+    *,
+    objective: str = "mse",
 ) -> dict:
     model.eval()
     predictions: list[Tensor] = []
@@ -61,12 +63,27 @@ def diagnose(
     currents: list[Tensor] = []
     embeddings: list[Tensor] = []
     stages: list[Tensor] = []
-    for batch in batches:
+    for batch_index, batch in enumerate(batches):
         grouped = model.encode_group(batch["history"], batch["goal"], batch["target"])
         history_z, goal_z, target_z = grouped[:, :-2], grouped[:, -2], grouped[:, -1]
-        predictions.append(model.predict_latents(history_z, goal_z).next_latent.cpu())
-        shuffled_predictions.append(model.predict_latents(history_z, goal_z.roll(1, 0)).next_latent.cpu())
-        zero_goal_predictions.append(model.predict_latents(history_z, torch.zeros_like(goal_z)).next_latent.cpu())
+        if objective == "flow":
+            generator = torch.Generator(device=target_z.device).manual_seed(40_000 + batch_index)
+            source_noise = torch.randn(
+                history_z.shape,
+                generator=generator,
+                device=history_z.device,
+                dtype=history_z.dtype,
+            )
+            prediction, _ = model.one_step_flow(history_z, goal_z, source_noise)
+            shuffled, _ = model.one_step_flow(history_z, goal_z.roll(1, 0), source_noise)
+            zero_goal, _ = model.one_step_flow(history_z, torch.zeros_like(goal_z), source_noise)
+            predictions.append(prediction[:, -1].cpu())
+            shuffled_predictions.append(shuffled[:, -1].cpu())
+            zero_goal_predictions.append(zero_goal[:, -1].cpu())
+        else:
+            predictions.append(model.predict_latents(history_z, goal_z).next_latent.cpu())
+            shuffled_predictions.append(model.predict_latents(history_z, goal_z.roll(1, 0)).next_latent.cpu())
+            zero_goal_predictions.append(model.predict_latents(history_z, torch.zeros_like(goal_z)).next_latent.cpu())
         targets.append(target_z.cpu())
         currents.append(history_z[:, -1].cpu())
         embeddings.append(grouped.flatten(0, 1).cpu())
