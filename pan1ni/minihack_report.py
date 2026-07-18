@@ -184,6 +184,8 @@ def run_report(
     eval_every: int,
     validation_samples: int,
     device: str,
+    num_workers: int = 0,
+    prefetch_factor: int = 2,
 ) -> Path:
     output.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(0)
@@ -200,16 +202,32 @@ def run_report(
         data_path, episode_keys=validation_keys, context_length=1,
         samples_per_epoch=validation_samples, seed=20_000,
     )
+    use_cuda = device.startswith("cuda")
+    loader_options = {
+        "num_workers": num_workers,
+        "pin_memory": use_cuda,
+    }
+    if num_workers > 0:
+        loader_options.update(
+            prefetch_factor=prefetch_factor,
+            persistent_workers=True,
+        )
     validation_batches = [
-        move_batch(batch, device) for batch in DataLoader(validation_data, batch_size=batch_size)
+        move_batch(batch, device, non_blocking=use_cuda)
+        for batch in DataLoader(validation_data, batch_size=batch_size, **loader_options)
     ]
     model = GoalConditionedLeWorldModel(pixel_model_config()).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
     timeline = [{"step": 0, "diagnostics": diagnose(model, validation_batches)}]
     started = time.perf_counter()
-    loader = DataLoader(train_data, batch_size=batch_size)
+    loader = DataLoader(train_data, batch_size=batch_size, **loader_options)
     for step, batch in enumerate(loader, start=1):
-        metrics = pretrain_step(model, move_batch(batch, device), optimizer, sigreg_slices=sigreg_slices)
+        metrics = pretrain_step(
+            model,
+            move_batch(batch, device, non_blocking=use_cuda),
+            optimizer,
+            sigreg_slices=sigreg_slices,
+        )
         if step % eval_every == 0 or step == steps:
             entry = {
                 "step": step,
@@ -241,6 +259,8 @@ def run_report(
             "sigreg_slices": sigreg_slices,
             "eval_every": eval_every,
             "validation_samples": validation_samples,
+            "num_workers": num_workers,
+            "prefetch_factor": prefetch_factor,
             "device": device,
             "training_episodes": len(training_keys),
             "validation_episodes": len(validation_keys),
@@ -263,12 +283,15 @@ def main() -> None:
     parser.add_argument("--sigreg-slices", type=int, default=256)
     parser.add_argument("--eval-every", type=int, default=50)
     parser.add_argument("--validation-samples", type=int, default=64)
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     path = run_report(
         Path(args.data), Path(args.output), steps=args.steps, batch_size=args.batch_size,
         sigreg_slices=args.sigreg_slices, eval_every=args.eval_every,
         validation_samples=args.validation_samples, device=args.device,
+        num_workers=args.num_workers, prefetch_factor=args.prefetch_factor,
     )
     print(path)
 

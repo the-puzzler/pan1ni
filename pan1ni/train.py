@@ -20,9 +20,18 @@ def _observation(batch: Batch, key: str) -> Mapping[str, Tensor]:
     return value
 
 
-def move_batch(batch: Batch, device: torch.device | str) -> dict:
+def move_batch(
+    batch: Batch,
+    device: torch.device | str,
+    *,
+    non_blocking: bool = False,
+) -> dict:
     return {
-        key: ({name: tensor.to(device) for name, tensor in value.items()} if isinstance(value, Mapping) else value.to(device))
+        key: (
+            {name: tensor.to(device, non_blocking=non_blocking) for name, tensor in value.items()}
+            if isinstance(value, Mapping)
+            else value.to(device, non_blocking=non_blocking)
+        )
         for key, value in batch.items()
     }
 
