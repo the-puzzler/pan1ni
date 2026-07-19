@@ -17,6 +17,7 @@ ACTION_FEATURES = (
     "predicted_next",
     "flow_residual",
     "idm",
+    "idm_history",
 )
 
 # Features in which the goal genuinely conditions the representation. current_latent
@@ -29,14 +30,23 @@ GOAL_AWARE_FEATURES = (
     "predictor_hidden",
     "predicted_next",
     "idm",
+    "idm_history",
 )
 
 
-def feature_dim(feature: str, latent_dim: int) -> int:
-    """Input width a policy head needs for a given predictor feature."""
+def feature_dim(feature: str, latent_dim: int, context_length: int | None = None) -> int:
+    """Input width a policy head needs for a given predictor feature.
+
+    ``idm_history`` concatenates every history-frame latent with the predicted next
+    latent, so it needs ``context_length``.
+    """
 
     if feature == "idm":
         return latent_dim * 3
+    if feature == "idm_history":
+        if context_length is None:
+            raise ValueError("idm_history feature_dim requires context_length")
+        return latent_dim * (context_length + 1)
     if feature in ACTION_FEATURES:
         return latent_dim
     raise ValueError(f"feature must be one of {ACTION_FEATURES}")
@@ -52,7 +62,7 @@ def predictor_features(
     model.eval()
     if feature in {
         "current_latent", "predictor_layer1", "predictor_layer2",
-        "predictor_hidden", "predicted_next", "idm",
+        "predictor_hidden", "predicted_next", "idm", "idm_history",
     }:
         grouped = model.encode_group(batch["history"], batch["goal"])
         history_z, goal_z = grouped[:, :-1], grouped[:, -1]
@@ -81,6 +91,10 @@ def predictor_features(
         predicted_next = prediction[:, -1]
         if feature == "predicted_next":
             return predicted_next
+        if feature == "idm_history":
+            # Full history stack plus the goal-conditioned predicted next state, so
+            # the head sees the whole approach, not just the last frame.
+            return torch.cat((history_z.flatten(1), predicted_next), dim=-1)
         # Inverse-dynamics feature: current state, the goal-conditioned predicted
         # next state, and their difference. Mirrors InverseDynamicsHead's inputs.
         return torch.cat((current, predicted_next, predicted_next - current), dim=-1)

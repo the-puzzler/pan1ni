@@ -26,10 +26,13 @@ def run(
     goal_horizon: int,
     min_goal_distance: int,
     seed: int,
+    max_goal_distance: int = 1_000_000,
+    goal_distance_mode: str = "mixed",
 ) -> Path:
     converter = TileConverter.create()
     references = []
     attempted_seed = seed
+    attempt_budget = episodes * 60
     while len(references) < episodes:
         reference = collect_reference_goal(
             env_id,
@@ -37,10 +40,18 @@ def run(
             converter,
             goal_horizon=goal_horizon,
             min_goal_distance=min_goal_distance,
+            max_goal_distance=max_goal_distance,
         )
         if reference is not None:
             references.append(reference)
         attempted_seed += 1
+        if attempted_seed - seed > attempt_budget:
+            break
+    if not references:
+        raise RuntimeError(
+            f"could not generate any reachable goals in mode '{goal_distance_mode}'"
+        )
+    episodes = len(references)
 
     records = []
     for episode, reference in enumerate(references):
@@ -114,6 +125,9 @@ def run(
         "spawn_monsters": False,
         "feature": "uniform_random",
         "action_policy": "uniform random over eight semantic movement classes",
+        "goal_distance_mode": goal_distance_mode,
+        "min_goal_distance": min_goal_distance,
+        "max_goal_distance": max_goal_distance,
         "episodes": episodes,
         "successes": len(successes),
         "success_rate": len(successes) / episodes,
@@ -144,6 +158,8 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=128)
     parser.add_argument("--goal-horizon", type=int, default=64)
     parser.add_argument("--min-goal-distance", type=int, default=3)
+    parser.add_argument("--max-goal-distance", type=int, default=1_000_000)
+    parser.add_argument("--goal-distance-mode", default="mixed")
     parser.add_argument("--seed", type=int, default=12345)
     args = parser.parse_args()
     print(
@@ -155,6 +171,8 @@ def main() -> None:
             goal_horizon=args.goal_horizon,
             min_goal_distance=args.min_goal_distance,
             seed=args.seed,
+            max_goal_distance=args.max_goal_distance,
+            goal_distance_mode=args.goal_distance_mode,
         )
     )
 

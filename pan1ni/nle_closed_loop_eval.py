@@ -133,6 +133,7 @@ def collect_reference_goal(
     *,
     goal_horizon: int,
     min_goal_distance: int,
+    max_goal_distance: int = 1_000_000,
 ) -> ReferenceGoal | None:
     rng = random.Random(seed + 71_003)
     env = _make_env(env_id, seed, max(goal_horizon + 8, 80))
@@ -154,7 +155,7 @@ def collect_reference_goal(
             if _distance(previous, position) == 1:
                 visited.add(position)
                 distance = _distance(initial_position, position)
-                if step >= 2 and distance >= min_goal_distance:
+                if step >= 2 and min_goal_distance <= distance <= max_goal_distance:
                     candidates.append((position, converter(observation), step, action))
             if terminated or truncated:
                 break
@@ -373,9 +374,13 @@ def run(
     fps: int,
     action_selection: str,
     temperature: float,
+    max_goal_distance: int = 1_000_000,
+    goal_distance_mode: str = "mixed",
 ) -> Path:
     if min(episodes, max_steps, goal_horizon, min_goal_distance, fps) < 1:
         raise ValueError("evaluation sizes must be positive")
+    if max_goal_distance < min_goal_distance:
+        raise ValueError("max_goal_distance must be >= min_goal_distance")
     if action_selection not in {"argmax", "sample"}:
         raise ValueError("action_selection must be 'argmax' or 'sample'")
     if temperature <= 0:
@@ -391,8 +396,9 @@ def run(
     feature = action_config["feature"]
     if int(action_config.get("num_classes", 10)) < 8:
         raise ValueError("action head must expose all eight semantic movement classes")
+    input_dim = int(action_config.get("feature_dim") or feature_dim(feature, model.config.latent_dim))
     head = DirectPolicyHead(
-        feature_dim(feature, model.config.latent_dim),
+        input_dim,
         int(action_config.get("num_classes", 10)),
         hidden_dim=int(action_config.get("action_hidden_dim", 1024)),
         hidden_layers=int(action_config.get("action_hidden_layers", 2)),
@@ -403,6 +409,9 @@ def run(
     converter = TileConverter.create()
     references: list[ReferenceGoal] = []
     attempted_seed = seed
+    # Far goals are rarer in confined dungeons, so cap the search generously and
+    # proceed with however many goals were found rather than crashing a queued run.
+    attempt_budget = episodes * 60
     while len(references) < episodes:
         reference = collect_reference_goal(
             env_id,
@@ -410,12 +419,25 @@ def run(
             converter,
             goal_horizon=goal_horizon,
             min_goal_distance=min_goal_distance,
+            max_goal_distance=max_goal_distance,
         )
         if reference is not None:
             references.append(reference)
         attempted_seed += 1
-        if attempted_seed - seed > episodes * 20:
-            raise RuntimeError("could not generate enough reachable procedural NLE goals")
+        if attempted_seed - seed > attempt_budget:
+            break
+    if not references:
+        raise RuntimeError(
+            f"could not generate any reachable procedural NLE goals in mode '{goal_distance_mode}' "
+            f"(distance {min_goal_distance}-{max_goal_distance})"
+        )
+    if len(references) < episodes:
+        print(
+            f"warning: only found {len(references)}/{episodes} goals in mode "
+            f"'{goal_distance_mode}' (distance {min_goal_distance}-{max_goal_distance})",
+            flush=True,
+        )
+    episodes = len(references)
 
     records = []
     for episode, reference in enumerate(references):
@@ -470,7 +492,9 @@ def run(
         "mean_revisit_rate": statistics.mean(record["revisit_rate"] for record in records),
         "max_steps": max_steps,
         "goal_horizon": goal_horizon,
+        "goal_distance_mode": goal_distance_mode,
         "min_goal_distance": min_goal_distance,
+        "max_goal_distance": max_goal_distance,
         "requested_seed": seed,
         "generated_through_seed": attempted_seed - 1,
         "video": str(video_output) if video_output is not None else None,
@@ -494,6 +518,8 @@ def main() -> None:
     parser.add_argument("--max-steps", type=int, default=128)
     parser.add_argument("--goal-horizon", type=int, default=64)
     parser.add_argument("--min-goal-distance", type=int, default=3)
+    parser.add_argument("--max-goal-distance", type=int, default=1_000_000)
+    parser.add_argument("--goal-distance-mode", default="mixed")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--fps", type=int, default=8)
     parser.add_argument("--action-selection", choices=("argmax", "sample"), default="argmax")
@@ -516,6 +542,8 @@ def main() -> None:
             fps=args.fps,
             action_selection=args.action_selection,
             temperature=args.temperature,
+            max_goal_distance=args.max_goal_distance,
+            goal_distance_mode=args.goal_distance_mode,
         )
     )
 

@@ -28,11 +28,18 @@ from .action import (
 from .config import ModelConfig
 from .model import GoalConditionedLeWorldModel
 from .nld_data import prefetch_batches
-from .player_tile_data import SEMANTIC_ACTION_NAMES, NLDPlayerTileGoalBatchStream
+from .player_tile_data import (
+    SEMANTIC_ACTION_NAMES,
+    SEMANTIC_STAIRS_ACTION_NAMES,
+    NLDPlayerTileGoalBatchStream,
+)
 from .train import move_batch
 
-MOVEMENT_CLASSES = 8
-MOVEMENT_ACTION_NAMES = SEMANTIC_ACTION_NAMES[:MOVEMENT_CLASSES]
+# Action sets: name -> (num_classes, stream action_mode, class names).
+ACTION_SETS = {
+    "movement": (8, "inferred_movement", SEMANTIC_ACTION_NAMES[:8]),
+    "movement_stairs": (10, "inferred_stairs", SEMANTIC_STAIRS_ACTION_NAMES),
+}
 
 
 def _slice_batch(batch: dict, size: int) -> dict:
@@ -47,21 +54,21 @@ def _slice_batch(batch: dict, size: int) -> dict:
 
 
 @torch.no_grad()
-def evaluate(model, head, batches: list[dict], feature: str) -> dict:
+def evaluate(model, head, batches: list[dict], feature: str, num_classes: int = 8) -> dict:
     model.eval()
     head.eval()
     count = 0
     loss_sum = 0.0
-    class_count = torch.zeros(MOVEMENT_CLASSES, dtype=torch.long)
-    class_correct = torch.zeros(MOVEMENT_CLASSES, dtype=torch.long)
+    class_count = torch.zeros(num_classes, dtype=torch.long)
+    class_correct = torch.zeros(num_classes, dtype=torch.long)
     for batch in batches:
         targets = batch["action"].long()
         logits = head(predictor_features(model, batch, feature))
         loss_sum += F.cross_entropy(logits, targets, reduction="sum").item()
         matches = logits.argmax(-1).eq(targets)
         count += targets.numel()
-        class_count += torch.bincount(targets.cpu(), minlength=MOVEMENT_CLASSES)
-        class_correct += torch.bincount(targets[matches].cpu(), minlength=MOVEMENT_CLASSES)
+        class_count += torch.bincount(targets.cpu(), minlength=num_classes)
+        class_correct += torch.bincount(targets[matches].cpu(), minlength=num_classes)
     supported = class_count > 0
     return {
         "loss": loss_sum / max(count, 1),
@@ -78,6 +85,7 @@ def evaluate(model, head, batches: list[dict], feature: str) -> dict:
 
 
 def _render_curves(payload: dict, output_path: Path) -> None:
+    num_classes = payload["config"]["num_classes"]
     timeline = payload["timeline"]
     eval_steps = [entry["step"] for entry in timeline]
     accuracy = [entry["player_validation"]["accuracy"] for entry in timeline]
@@ -92,7 +100,7 @@ def _render_curves(payload: dict, output_path: Path) -> None:
     feature = payload["config"]["feature"]
     figure.suptitle(
         f"Movement action head — feature: {feature} "
-        f"(chance balanced acc = {1 / MOVEMENT_CLASSES:.1%})",
+        f"(chance balanced acc = {1 / num_classes:.1%})",
         fontsize=13,
     )
     axes[0].plot(train_steps, train_loss, marker="o", markersize=3, color="#22d3ee", label="train")
@@ -101,7 +109,7 @@ def _render_curves(payload: dict, output_path: Path) -> None:
     axes[0].legend(frameon=False)
     axes[1].plot(eval_steps, accuracy, marker="o", markersize=3, color="#70d6a5", label="accuracy")
     axes[1].plot(eval_steps, balanced, marker="o", markersize=3, color="#c084fc", label="balanced")
-    axes[1].axhline(1 / MOVEMENT_CLASSES, color="#64748b", linestyle="--", linewidth=1, label="chance")
+    axes[1].axhline(1 / num_classes, color="#64748b", linestyle="--", linewidth=1, label="chance")
     axes[1].set(title="Held-out human-move accuracy", xlabel="step", ylabel="accuracy", ylim=(0, 1))
     axes[1].legend(frameon=False)
     for axis in axes:
@@ -133,6 +141,7 @@ def run(
     windows_per_block: int,
     window_stride: int,
     device: str,
+    action_set: str = "movement",
 ) -> Path:
     if min(
         steps, decode_batch_size, batch_size, context_length, goal_horizon, hidden_dim,
@@ -142,6 +151,9 @@ def run(
         raise ValueError("training and stream sizes must be positive")
     if feature not in GOAL_AWARE_FEATURES:
         raise ValueError(f"feature must be one of {GOAL_AWARE_FEATURES}")
+    if action_set not in ACTION_SETS:
+        raise ValueError(f"action_set must be one of {tuple(ACTION_SETS)}")
+    num_classes, action_mode, action_names = ACTION_SETS[action_set]
     output.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(0)
     use_cuda = device.startswith("cuda")
@@ -159,8 +171,8 @@ def run(
     model.eval()
 
     head = DirectPolicyHead(
-        feature_dim(feature, model.config.latent_dim),
-        MOVEMENT_CLASSES,
+        feature_dim(feature, model.config.latent_dim, context_length),
+        num_classes,
         hidden_dim=hidden_dim,
         hidden_layers=hidden_layers,
     ).to(device)
@@ -185,21 +197,21 @@ def run(
             shuffle=shuffle,
             loop_forever=True,
             seed=seed,
-            action_mode="inferred_movement",
+            action_mode=action_mode,
         )
 
     # Inverse-frequency class weights estimated on the training split only. Movement is
     # heavily imbalanced (cardinal moves ~5x more frequent than diagonals).
     weight_stream = make_stream(seed=30_000, ids=train_ids, bsz=decode_batch_size, windows=windows_per_block, shuffle=True)
-    movement_counts = torch.zeros(MOVEMENT_CLASSES, dtype=torch.long)
+    movement_counts = torch.zeros(num_classes, dtype=torch.long)
     counted = 0
     for batch in weight_stream:
-        movement_counts += torch.bincount(batch["action"].long(), minlength=MOVEMENT_CLASSES)
+        movement_counts += torch.bincount(batch["action"].long(), minlength=num_classes)
         counted += batch["action"].numel()
         if counted >= class_weight_samples:
             break
     supported = movement_counts > 0
-    class_weights = torch.zeros(MOVEMENT_CLASSES, dtype=torch.float32)
+    class_weights = torch.zeros(num_classes, dtype=torch.float32)
     class_weights[supported] = counted / (supported.sum() * movement_counts[supported].float())
     class_weights.clamp_(max=10.0)
     class_weights[supported] /= class_weights[supported].mean()
@@ -219,7 +231,7 @@ def run(
     player_stream = make_stream(seed=0, ids=train_ids, bsz=decode_batch_size, windows=windows_per_block, shuffle=True)
     iterator = prefetch_batches(iter(player_stream), prefetch_depth)
 
-    initial = evaluate(model, head, validation_batches, feature)
+    initial = evaluate(model, head, validation_batches, feature, num_classes)
     timeline = [{"step": 0, "player_validation": initial, "selection_balanced_accuracy": initial["balanced_accuracy"]}]
     best_balanced = 0.0
     trained_samples = 0
@@ -240,7 +252,7 @@ def run(
             loss.backward()
             optimizer.step()
             if step % eval_every == 0 or step == steps:
-                validation = evaluate(model, head, validation_batches, feature)
+                validation = evaluate(model, head, validation_batches, feature, num_classes)
                 balanced = float(validation["balanced_accuracy"])
                 timeline.append(
                     {
@@ -257,10 +269,11 @@ def run(
                             "head": head.state_dict(),
                             "config": {
                                 "feature": feature,
-                                "target": "movement_8",
-                                "num_classes": MOVEMENT_CLASSES,
+                                "target": action_set,
+                                "num_classes": num_classes,
                                 "action_hidden_dim": hidden_dim,
                                 "action_hidden_layers": hidden_layers,
+                                "feature_dim": feature_dim(feature, model.config.latent_dim, context_length),
                             },
                         },
                         output / "best_action_checkpoint.pt",
@@ -280,11 +293,12 @@ def run(
         "world_checkpoint": str(checkpoint_path),
         "world_step": int(checkpoint["step"]),
         "feature": feature,
-        "target": "movement_8",
-        "action_names": list(MOVEMENT_ACTION_NAMES),
-        "num_classes": MOVEMENT_CLASSES,
+        "target": action_set,
+        "action_set": action_set,
+        "action_names": list(action_names),
+        "num_classes": num_classes,
         "human_source": player_dataset,
-        "human_label_method": "successful one-cell @ cursor delta",
+        "human_label_method": "one-cell @ cursor delta (moves) + Dlvl change (stairs)",
         "human_train_games": len(train_ids),
         "human_validation_games": len(validation_ids),
         "steps": steps,
@@ -296,7 +310,7 @@ def run(
         "action_hidden_dim": hidden_dim,
         "action_hidden_layers": hidden_layers,
         "action_parameters": sum(parameter.numel() for parameter in head.parameters()),
-        "feature_dim": feature_dim(feature, model.config.latent_dim),
+        "feature_dim": feature_dim(feature, model.config.latent_dim, context_length),
         "best_balanced_accuracy": best_balanced,
         "backbone_frozen": True,
         "elapsed_seconds": time.perf_counter() - started,
@@ -324,6 +338,7 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, default=1024)
     parser.add_argument("--hidden-layers", type=int, default=2)
     parser.add_argument("--feature", choices=GOAL_AWARE_FEATURES, default="predictor_hidden")
+    parser.add_argument("--action-set", choices=tuple(ACTION_SETS), default="movement")
     parser.add_argument("--class-weight-samples", type=int, default=20000)
     parser.add_argument("--eval-every", type=int, default=200)
     parser.add_argument("--validation-samples", type=int, default=1024)
@@ -355,6 +370,7 @@ def main() -> None:
             windows_per_block=args.windows_per_block,
             window_stride=args.window_stride,
             device=args.device,
+            action_set=args.action_set,
         )
     )
 

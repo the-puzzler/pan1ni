@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -49,6 +50,12 @@ def _pixel_observation(
     return {"pixels": value.unsqueeze(0).to(device)}
 
 
+SEMANTIC_STAIRS_ACTION_NAMES = SEMANTIC_ACTION_NAMES[:8] + ("descend", "ascend")
+DESCEND_ACTION = 8
+ASCEND_ACTION = 9
+_DLVL_RE = re.compile(rb"Dlvl:(\d+)")
+
+
 def infer_movement_actions(current: np.ndarray, following: np.ndarray) -> np.ndarray:
     """Infer successful one-cell semantic moves from absolute tty cursors."""
 
@@ -56,6 +63,44 @@ def infer_movement_actions(current: np.ndarray, following: np.ndarray) -> np.nda
     actions = np.full(delta.shape[:-1], -1, dtype=np.int16)
     for movement, action in CURSOR_DELTA_TO_ACTION.items():
         actions[(delta[..., 0] == movement[0]) & (delta[..., 1] == movement[1])] = action
+    return actions
+
+
+def parse_dlvl(frames: np.ndarray) -> np.ndarray:
+    """Read the dungeon level from the tty status line for a stack of frames.
+
+    ``frames`` is ``(N, 24, 80)`` uint8; returns ``(N,)`` int with the parsed
+    ``Dlvl`` or ``-1`` where the status line could not be read.
+    """
+
+    out = np.full(frames.shape[0], -1, dtype=np.int64)
+    for i in range(frames.shape[0]):
+        for row in (22, 23, 21, 20):
+            match = _DLVL_RE.search(frames[i, row].astype(np.uint8).tobytes())
+            if match:
+                out[i] = int(match.group(1))
+                break
+    return out
+
+
+def infer_stairs_actions(
+    current_cursor: np.ndarray,
+    following_cursor: np.ndarray,
+    current_frame: np.ndarray,
+    following_frame: np.ndarray,
+) -> np.ndarray:
+    """Semantic actions = eight one-cell moves plus descend/ascend from Dlvl deltas.
+
+    Descend/ascend take priority: a stairs transition changes the whole level, so
+    its cursor delta is never a unit move and would otherwise be rejected.
+    """
+
+    actions = infer_movement_actions(current_cursor, following_cursor).astype(np.int16)
+    dlvl0 = parse_dlvl(current_frame)
+    dlvl1 = parse_dlvl(following_frame)
+    parsed = (dlvl0 >= 0) & (dlvl1 >= 0)
+    actions[parsed & (dlvl1 == dlvl0 + 1)] = DESCEND_ACTION
+    actions[parsed & (dlvl1 == dlvl0 - 1)] = ASCEND_ACTION
     return actions
 
 
@@ -109,8 +154,10 @@ class NLDPlayerTileGoalBatchStream:
                 [mapper.tiles[index] for index in range(max(mapper.tiles) + 1)]
             )
         self.tile_atlas = tile_atlas
-        if action_mode not in {"recorded", "inferred_movement"}:
-            raise ValueError("action_mode must be 'recorded' or 'inferred_movement'")
+        if action_mode not in {"recorded", "inferred_movement", "inferred_stairs"}:
+            raise ValueError(
+                "action_mode must be 'recorded', 'inferred_movement', or 'inferred_stairs'"
+            )
         self.action_mode = action_mode
 
     def available_gameids(self) -> list[int]:
@@ -191,6 +238,14 @@ class NLDPlayerTileGoalBatchStream:
                         inferred_actions = infer_movement_actions(
                             raw["tty_cursor"][:, current],
                             raw["tty_cursor"][:, current + 1],
+                        )
+                        valid &= inferred_actions >= 0
+                    elif self.action_mode == "inferred_stairs":
+                        inferred_actions = infer_stairs_actions(
+                            raw["tty_cursor"][:, current],
+                            raw["tty_cursor"][:, current + 1],
+                            raw["tty_chars"][:, current],
+                            raw["tty_chars"][:, current + 1],
                         )
                         valid &= inferred_actions >= 0
                     if not valid.any():

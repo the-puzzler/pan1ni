@@ -99,6 +99,25 @@ def _save(
     )
 
 
+def _archive_checkpoint(
+    output: Path,
+    model: GoalConditionedLeWorldModel,
+    optimizer: torch.optim.Optimizer,
+    step: int,
+) -> None:
+    """Write a permanent, step-tagged checkpoint that later steps never overwrite."""
+
+    torch.save(
+        {
+            "model": model.state_dict(),
+            "optimizer": optimizer.state_dict(),
+            "step": step,
+            "config": asdict(model.config),
+        },
+        output / f"checkpoint-step{step}.pt",
+    )
+
+
 def run(
     player_db: Path,
     player_dataset: str,
@@ -124,6 +143,8 @@ def run(
     window_stride: int,
     device: str,
     resume: Path | None = None,
+    archive_every: int = 0,
+    learning_rate: float = 3e-4,
 ) -> Path:
     if context_length != 8:
         raise ValueError("the approved pixel experiment uses exactly eight context frames")
@@ -225,7 +246,7 @@ def run(
     if model_config.observation_mode != "pixels":
         raise RuntimeError("pixel-flow training requires native tile pixels")
     model = GoalConditionedLeWorldModel(model_config).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
     start_step = 0
     timeline: list[dict] = []
     if resume is not None:
@@ -236,6 +257,10 @@ def run(
             raise ValueError(f"refusing to resume a non-{objective} checkpoint")
         model.load_state_dict(checkpoint["model"])
         optimizer.load_state_dict(checkpoint["optimizer"])
+        # load_state_dict restores the checkpoint's LR; override so --learning-rate
+        # actually takes effect when continuing a run at a different rate.
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
         start_step = int(checkpoint["step"])
         metrics_path = resume.with_name("metrics.json")
         if metrics_path.exists():
@@ -316,7 +341,7 @@ def run(
         "random_future_goal": True,
         "sigreg_weight": sigreg_weight,
         "sigreg_slices": sigreg_slices,
-        "learning_rate": 3e-4,
+        "learning_rate": learning_rate,
         "eval_every": eval_every,
         "checkpoint_every": checkpoint_every,
         "player_train_games": len(player_train_ids),
@@ -384,6 +409,8 @@ def run(
                 )
             if step % checkpoint_every == 0 or step == steps:
                 _save(output, model, optimizer, step, timeline, config)
+            if archive_every and (step % archive_every == 0 or step == steps):
+                _archive_checkpoint(output, model, optimizer, step)
     finally:
         close = getattr(player_iterator, "close", None)
         if close is not None:
@@ -428,6 +455,13 @@ def main() -> None:
     parser.add_argument("--windows-per-block", type=int, default=4)
     parser.add_argument("--window-stride", type=int, default=16)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument(
+        "--archive-every",
+        type=int,
+        default=0,
+        help="also write a permanent checkpoint-step{N}.pt every N steps (0 = off)",
+    )
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
     print(
@@ -455,6 +489,8 @@ def main() -> None:
             window_stride=args.window_stride,
             device=args.device,
             resume=args.resume,
+            archive_every=args.archive_every,
+            learning_rate=args.learning_rate,
         )
     )
 
