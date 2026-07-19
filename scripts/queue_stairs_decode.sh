@@ -10,7 +10,7 @@ action_output="${2:-reports/stairs-decode}"
 steps="${STEPS:-6000}"
 val_samples="${VAL_SAMPLES:-4000}"
 
-features=(predictor_layer1 predictor_layer2 predictor_hidden predicted_next idm idm_history)
+read -ra features <<< "${FEATURES:-idm idm_history}"
 mkdir -p "${action_output}"
 for feature in "${features[@]}"; do
   echo "=== training 10-class stairs head: ${feature} ==="

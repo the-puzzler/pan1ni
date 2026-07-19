@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Round 3: wait for the stairs-decoding experiment (which itself waits for round 2)
 # to finish and free the GPU, then continue 200k -> 300k at a further-reduced LR and
-# rerun the full head-training + 3-mode closed-loop evaluation on the 300k model.
+# rerun head-training + 3-mode closed-loop evaluation on the 300k model. Uses the
+# idm-only driver copy (idm + idm_history features), per the "IDM variants only" call.
 set -uo pipefail
 
 stairs_log="${STAIRS_LOG:-/tmp/claude-0/-workspace-pan1ni/05ce2056-535d-456e-b5b0-441c15b27289/scratchpad/stairs-run.log}"
@@ -23,10 +24,11 @@ if [ ! -f reports/pixel-mse-player-only-sigreg02-200k/checkpoint.pt ]; then
   echo "ERROR: 200k checkpoint missing; aborting round 3." >&2
   exit 1
 fi
-echo "=== starting round3: 200k -> 300k, lr 1e-4 ==="
+echo "=== starting round3: 200k -> 300k, lr 1e-4, idm variants only ==="
 OLD=reports/pixel-mse-player-only-sigreg02-200k \
 NEW=reports/pixel-mse-player-only-sigreg02-300k \
 ACT=reports/pixel-mse-player-only-sigreg02-300k-action \
 STEPS=300000 \
 LR=1e-4 \
-exec bash scripts/queue_continue_pretrain_then_eval.sh
+FEATURES="idm idm_history" \
+exec bash scripts/queue_continue_idm.sh
