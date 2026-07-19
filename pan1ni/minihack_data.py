@@ -72,13 +72,16 @@ def make_keyroom_env(
     key_position: tuple[int, int] = KEY_POSITIONS[0],
     goal_position: tuple[int, int] = GOAL_POSITIONS[0],
     seed: int | None = None,
+    actions: tuple | None = None,
 ):
+    action_options = {} if actions is None else {"actions": actions}
     if env_id == KEYROOM_ENV:
         env = MiniHackKeyDoor(
             des_file=keyroom_des(key_position, goal_position),
             observation_keys=OBSERVATION_KEYS,
             obs_crop_h=9,
             obs_crop_w=9,
+            **action_options,
         )
     else:
         env = gym.make(
@@ -86,6 +89,7 @@ def make_keyroom_env(
             observation_keys=OBSERVATION_KEYS,
             obs_crop_h=9,
             obs_crop_w=9,
+            **action_options,
         )
     if seed is not None:
         env.unwrapped.seed(core=seed, disp=seed, reseed=True)
@@ -342,6 +346,9 @@ class MiniHackPixelGoalDataset(Dataset[dict]):
         *,
         episode_keys: Iterable[str] | None = None,
         context_length: int = 1,
+        goal_horizon: int = 64,
+        random_future_goal: bool = False,
+        pad_initial_context: bool = False,
         samples_per_epoch: int = 10_000,
         seed: int = 0,
     ) -> None:
@@ -349,12 +356,21 @@ class MiniHackPixelGoalDataset(Dataset[dict]):
         with h5py.File(self.path, "r") as handle:
             available = sorted(handle.keys(), key=int)
             requested = available if episode_keys is None else list(episode_keys)
+            minimum_length = (
+                3
+                if pad_initial_context
+                else context_length + (2 if random_future_goal else 1)
+            )
             self.episode_keys = [
-                key for key in requested if key in handle and handle[key]["pixels"].shape[0] >= context_length + 1
+                key for key in requested
+                if key in handle and handle[key]["pixels"].shape[0] >= minimum_length
             ]
         if not self.episode_keys:
             raise ValueError("no MiniHack episodes are long enough")
         self.context_length = context_length
+        self.goal_horizon = goal_horizon
+        self.random_future_goal = random_future_goal
+        self.pad_initial_context = pad_initial_context
         self.samples_per_epoch = samples_per_epoch
         self.seed = seed
         self._handle: h5py.File | None = None
@@ -377,18 +393,99 @@ class MiniHackPixelGoalDataset(Dataset[dict]):
         key = self.episode_keys[rng.randrange(len(self.episode_keys))]
         group = self.handle[key]
         length = group["pixels"].shape[0]
-        t = rng.randint(self.context_length - 1, length - 2)
-        start = t - self.context_length + 1
-        final = length - 1
+        if self.random_future_goal:
+            # Keep the goal strictly beyond the one-step target.
+            t = rng.randint(0 if self.pad_initial_context else self.context_length - 1, length - 3)
+            goal_t = rng.randint(t + 2, min(length - 1, t + self.goal_horizon))
+        else:
+            t = rng.randint(self.context_length - 1, length - 2)
+            goal_t = length - 1
+        start = max(0, t - self.context_length + 1)
+        history = group["pixels"][start : t + 1]
+        if self.pad_initial_context and history.shape[0] < self.context_length:
+            padding = np.repeat(history[:1], self.context_length - history.shape[0], axis=0)
+            history = np.concatenate((padding, history), axis=0)
         return {
-            "history": {"pixels": self._pixels(group["pixels"][start : t + 1])},
-            "goal": {"pixels": self._pixels(group["pixels"][final])},
+            "history": {"pixels": self._pixels(history)},
+            "goal": {"pixels": self._pixels(group["pixels"][goal_t])},
             "target": {"pixels": self._pixels(group["pixels"][t + 1])},
             "action": torch.tensor(group["actions"][t], dtype=torch.long),
-            "goal_offset": torch.tensor(final - t, dtype=torch.long),
+            "goal_offset": torch.tensor(goal_t - t, dtype=torch.long),
             "timestep": torch.tensor(t, dtype=torch.long),
             "trajectory_id": torch.tensor(int(key), dtype=torch.long),
             "stage": torch.tensor(group["stages"][t], dtype=torch.long),
+        }
+
+    def __del__(self) -> None:
+        if self._handle is not None:
+            self._handle.close()
+
+
+class MiniHackSpecialActionDataset(Dataset[dict]):
+    """Sample only pickup/apply examples for a semantic 10-action decoder."""
+
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        episode_keys: Iterable[str] | None = None,
+        context_length: int = 8,
+        goal_horizon: int = 64,
+        samples_per_epoch: int = 10_000,
+        seed: int = 0,
+    ) -> None:
+        self.path = Path(path)
+        self.context_length = context_length
+        self.goal_horizon = goal_horizon
+        self.samples_per_epoch = samples_per_epoch
+        self.seed = seed
+        self._handle: h5py.File | None = None
+        with h5py.File(self.path, "r") as handle:
+            available = sorted(handle.keys(), key=int)
+            requested = available if episode_keys is None else list(episode_keys)
+            self.examples = []
+            for key in requested:
+                if key not in handle:
+                    continue
+                actions = handle[key]["actions"][:]
+                length = handle[key]["pixels"].shape[0]
+                self.examples.extend(
+                    (key, int(timestep))
+                    for timestep in np.flatnonzero(actions >= 8)
+                    if timestep <= length - 3
+                )
+        if not self.examples:
+            raise ValueError("no pickup/apply examples with future goals")
+
+    def __len__(self) -> int:
+        return self.samples_per_epoch
+
+    @property
+    def handle(self) -> h5py.File:
+        if self._handle is None:
+            self._handle = h5py.File(self.path, "r")
+        return self._handle
+
+    def __getitem__(self, index: int) -> dict:
+        rng = random.Random(self.seed + index)
+        key, timestep = self.examples[rng.randrange(len(self.examples))]
+        group = self.handle[key]
+        length = group["pixels"].shape[0]
+        goal_t = rng.randint(timestep + 2, min(length - 1, timestep + self.goal_horizon))
+        start = max(0, timestep - self.context_length + 1)
+        history = group["pixels"][start : timestep + 1]
+        if history.shape[0] < self.context_length:
+            padding = np.repeat(history[:1], self.context_length - history.shape[0], axis=0)
+            history = np.concatenate((padding, history), axis=0)
+        pixels = MiniHackPixelGoalDataset._pixels
+        return {
+            "history": {"pixels": pixels(history)},
+            "goal": {"pixels": pixels(group["pixels"][goal_t])},
+            "target": {"pixels": pixels(group["pixels"][timestep + 1])},
+            "action": torch.tensor(group["actions"][timestep], dtype=torch.long),
+            "goal_offset": torch.tensor(goal_t - timestep, dtype=torch.long),
+            "timestep": torch.tensor(timestep, dtype=torch.long),
+            "trajectory_id": torch.tensor(int(key), dtype=torch.long),
         }
 
     def __del__(self) -> None:

@@ -12,7 +12,17 @@ from .action import DirectPolicyHead, set_backbone_trainable
 from .config import ModelConfig
 from .model import GoalConditionedLeWorldModel
 from .nld_data import NLDTtyrecGoalBatchStream, prefetch_streams
+from .player_tile_data import NLDPlayerTileGoalBatchStream
 from .train import move_batch
+
+ACTION_FEATURES = (
+    "current_latent",
+    "predictor_layer1",
+    "predictor_layer2",
+    "predictor_hidden",
+    "predicted_next",
+    "flow_residual",
+)
 
 
 @torch.no_grad()
@@ -23,8 +33,34 @@ def predictor_features(
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
     model.eval()
-    if feature == "predictor_hidden":
-        return model(batch["history"], batch["goal"]).hidden
+    if feature in {
+        "current_latent", "predictor_layer1", "predictor_layer2",
+        "predictor_hidden", "predicted_next",
+    }:
+        grouped = model.encode_group(batch["history"], batch["goal"])
+        history_z, goal_z = grouped[:, :-1], grouped[:, -1]
+        if feature == "current_latent":
+            return history_z[:, -1]
+        steps = history_z.size(1)
+        value = model.predictor.dropout(
+            history_z + model.predictor.position[:, :steps]
+        )
+        conditioning = goal_z[:, None].expand(-1, steps, -1)
+        requested_layer = {
+            "predictor_layer1": 1,
+            "predictor_layer2": 2,
+        }.get(feature)
+        for layer_index, layer in enumerate(model.predictor.layers, start=1):
+            value = layer(value, conditioning)
+            if requested_layer == layer_index:
+                return model.predictor.norm(value)[:, -1]
+        hidden = model.predictor.norm(value)
+        if feature == "predictor_hidden":
+            return hidden[:, -1]
+        prediction = model.pred_proj(hidden.flatten(0, 1)).unflatten(
+            0, hidden.shape[:2]
+        )
+        return prediction[:, -1]
     if feature == "flow_residual":
         grouped = model.encode_group(batch["history"], batch["goal"])
         history_z, goal_z = grouped[:, :-1], grouped[:, -1]
@@ -36,7 +72,7 @@ def predictor_features(
         )
         _, residual = model.one_step_flow(history_z, goal_z, source_noise)
         return residual[:, -1]
-    raise ValueError("feature must be 'predictor_hidden' or 'flow_residual'")
+    raise ValueError(f"feature must be one of {ACTION_FEATURES}")
 
 
 @torch.no_grad()
@@ -123,6 +159,11 @@ def run(
         raise ValueError("context length exceeds the pretrained model's maximum context")
     set_backbone_trainable(model, False)
     model.eval()
+    stream_type = (
+        NLDPlayerTileGoalBatchStream
+        if model.config.observation_mode == "pixels"
+        else NLDTtyrecGoalBatchStream
+    )
 
     head = DirectPolicyHead(
         model.config.latent_dim,
@@ -132,7 +173,7 @@ def run(
     ).to(device)
     optimizer = torch.optim.AdamW(head.parameters(), lr=3e-4)
 
-    catalog = NLDTtyrecGoalBatchStream(
+    catalog = stream_type(
         db_path, dataset_name, batch_size=1, num_workers=1
     )
     gameids = catalog.available_gameids()
@@ -143,7 +184,7 @@ def run(
 
     # Estimate inverse-frequency weights on the training split only. Clipping
     # prevents a key observed once from overwhelming an entire minibatch.
-    weight_stream = NLDTtyrecGoalBatchStream(
+    weight_stream = stream_type(
         db_path,
         dataset_name,
         batch_size=batch_size,
@@ -175,7 +216,7 @@ def run(
     class_weights = class_weights.to(device)
 
     validation_batch_size = min(batch_size, len(validation_ids))
-    validation_stream = NLDTtyrecGoalBatchStream(
+    validation_stream = stream_type(
         db_path,
         dataset_name,
         batch_size=validation_batch_size,
@@ -196,7 +237,7 @@ def run(
             break
 
     streams = [
-        NLDTtyrecGoalBatchStream(
+        stream_type(
             db_path,
             dataset_name,
             batch_size=batch_size,
@@ -270,6 +311,7 @@ def run(
             "validation_games": len(validation_ids),
             "validation_samples": validation_seen,
             "target": "raw_keycode",
+            "representation": model.config.observation_mode,
             "num_classes": 256,
             "feature": feature,
             "backbone_frozen": True,
@@ -305,7 +347,7 @@ def main() -> None:
     parser.add_argument("--class-weight-samples", type=int, default=100000)
     parser.add_argument(
         "--feature",
-        choices=("predictor_hidden", "flow_residual"),
+        choices=ACTION_FEATURES,
         default="predictor_hidden",
     )
     parser.add_argument("--eval-every", type=int, default=200)

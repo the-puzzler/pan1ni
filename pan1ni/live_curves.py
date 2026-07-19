@@ -13,6 +13,11 @@ def render(metrics_path: Path, output_path: Path) -> int:
     payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     timeline = payload["timeline"]
     trained = [entry for entry in timeline if "train_sigreg_loss" in entry]
+    diagnostic_key = (
+        "simulator_diagnostics"
+        if "simulator_diagnostics" in timeline[0]
+        else "diagnostics"
+    )
     steps = [entry["step"] for entry in timeline]
     train_steps = [entry["step"] for entry in trained]
 
@@ -20,16 +25,28 @@ def render(metrics_path: Path, output_path: Path) -> int:
     figure, axes = plt.subplots(1, 3, figsize=(15, 4.5), constrained_layout=True)
     latest_step = timeline[-1]["step"]
     total_steps = payload["config"]["steps"]
+    is_flow = payload["config"].get("objective") == "flow"
     figure.suptitle(f"Training progress — step {latest_step:,}/{total_steps:,}", fontsize=14)
 
     axes[0].plot(
         steps,
-        [entry["diagnostics"]["latent_effective_rank"] for entry in timeline],
+        [entry[diagnostic_key]["latent_effective_rank"] for entry in timeline],
         marker="o",
         markersize=3,
+        label="simulator" if "player_diagnostics" in timeline[0] else "held-out",
         color="#c084fc",
     )
-    axes[0].set(title="Effective rank", xlabel="Step", ylabel="Rank")
+    if "player_diagnostics" in timeline[0]:
+        axes[0].plot(
+            steps,
+            [entry["player_diagnostics"]["latent_effective_rank"] for entry in timeline],
+            marker="o",
+            markersize=3,
+            label="player",
+            color="#22d3ee",
+        )
+    axes[0].set(title="Effective rank by held-out source", xlabel="Step", ylabel="Rank")
+    axes[0].legend(frameon=False, fontsize=8)
 
     axes[1].plot(
         train_steps,
@@ -40,7 +57,7 @@ def render(metrics_path: Path, output_path: Path) -> int:
     )
     axes[1].set(title="SIGReg", xlabel="Step", ylabel="Loss")
 
-    diagnostics = [entry["diagnostics"] for entry in timeline]
+    diagnostics = [entry[diagnostic_key] for entry in timeline]
     axes[2].plot(
         steps,
         [item["prediction_loss"] for item in diagnostics],
@@ -49,12 +66,22 @@ def render(metrics_path: Path, output_path: Path) -> int:
         label="held-out predictor",
         color="#fb7185",
     )
-    axes[2].plot(
-        train_steps,
-        [entry["train_prediction_loss"] for entry in trained],
-        label="train predictor",
-        color="#fbbf24",
-    )
+    if not is_flow:
+        axes[2].plot(
+            train_steps,
+            [entry["train_prediction_loss"] for entry in trained],
+            label="train predictor",
+            color="#fbbf24",
+        )
+    if "player_diagnostics" in timeline[0]:
+        axes[2].plot(
+            steps,
+            [entry["player_diagnostics"]["prediction_loss"] for entry in timeline],
+            marker="o",
+            markersize=3,
+            label="held-out player",
+            color="#22d3ee",
+        )
     axes[2].plot(
         steps,
         [item["copy_current_loss"] for item in diagnostics],
@@ -74,7 +101,11 @@ def render(metrics_path: Path, output_path: Path) -> int:
         color="#f472b6",
         alpha=0.7,
     )
-    axes[2].set(title="Next-state MSE", xlabel="Step", ylabel="MSE")
+    axes[2].set(
+        title="One-step next-state MSE" if is_flow else "Next-state MSE",
+        xlabel="Step",
+        ylabel="MSE",
+    )
     axes[2].legend(frameon=False, fontsize=8)
 
     for axis in axes:
