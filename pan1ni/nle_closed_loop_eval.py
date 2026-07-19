@@ -18,14 +18,12 @@ from minihack.tiles.glyph_mapper import GlyphMapper
 from nle import nethack
 from PIL import Image, ImageDraw, ImageFont
 
-from .action import DirectPolicyHead
+from .action import DirectPolicyHead, feature_dim, predictor_features
 from .config import ModelConfig
-from .minihack_closed_loop_video import _pixel_observation
 from .minihack_report import _render_frame
 from .model import GoalConditionedLeWorldModel
-from .nld_action_train import predictor_features
 from .player_tile_converter import build_canonical_lookup, player_centered_tile_crop
-from .player_tile_data import SEMANTIC_ACTION_NAMES
+from .player_tile_data import SEMANTIC_ACTION_NAMES, _pixel_observation
 
 
 MOVEMENT_ACTIONS = tuple(nethack.CompassDirection)
@@ -394,7 +392,7 @@ def run(
     if int(action_config.get("num_classes", 10)) < 8:
         raise ValueError("action head must expose all eight semantic movement classes")
     head = DirectPolicyHead(
-        model.config.latent_dim,
+        feature_dim(feature, model.config.latent_dim),
         int(action_config.get("num_classes", 10)),
         hidden_dim=int(action_config.get("action_hidden_dim", 1024)),
         hidden_layers=int(action_config.get("action_hidden_layers", 2)),

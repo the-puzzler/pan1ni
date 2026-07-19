@@ -29,12 +29,20 @@ def run(root: Path, output: Path, evaluation_name: str) -> tuple[Path, Path]:
         else:
             heldout_accuracy = None
             heldout_balanced_accuracy = None
+        # Softer, navigation-fair success: reaching the goal cell OR its immediate
+        # neighbourhood counts, even if a later step oversteps it. The strict
+        # success_rate requires landing on the exact cell (and stops on contact).
+        near_goal = sum(record["best_distance"] <= 1 for record in records) / len(records)
+        touched_goal = sum(record["best_distance"] == 0 for record in records) / len(records)
         rows.append(
             {
                 "feature": evaluation["feature"],
                 "episodes": evaluation["episodes"],
                 "successes": evaluation["successes"],
                 "success_rate": evaluation["success_rate"],
+                "touched_goal_rate": touched_goal,
+                "near_goal_rate": near_goal,
+                "mean_best_distance": sum(record["best_distance"] for record in records) / len(records),
                 "mean_best_progress": evaluation["mean_best_progress"],
                 "mean_final_progress": sum(
                     max(-1.0, min(1.0, record["final_progress"])) for record in records
@@ -48,7 +56,7 @@ def run(root: Path, output: Path, evaluation_name: str) -> tuple[Path, Path]:
         )
     if not rows:
         raise ValueError(f"no completed full-NLE ablations under {root}")
-    rows.sort(key=lambda row: (row["success_rate"], row["mean_best_progress"]), reverse=True)
+    rows.sort(key=lambda row: (row["near_goal_rate"], row["success_rate"]), reverse=True)
     summary_path = output.with_suffix(".json")
     summary_path.write_text(json.dumps({"ablations": rows}, indent=2), encoding="utf-8")
 
@@ -56,8 +64,22 @@ def run(root: Path, output: Path, evaluation_name: str) -> tuple[Path, Path]:
     figure, axes = plt.subplots(1, 3, figsize=(16, 4.8), constrained_layout=True)
     labels = [row["feature"] for row in rows]
     x = list(range(len(rows)))
-    axes[0].bar(x, [row["success_rate"] for row in rows], color="#70d6a5")
-    axes[0].set(title="Full-NLE goal success", ylabel="Success rate", ylim=(0, 1))
+    axes[0].bar(
+        [index - 0.2 for index in x],
+        [row["near_goal_rate"] for row in rows],
+        width=0.4,
+        label="reached goal (<=1 cell)",
+        color="#70d6a5",
+    )
+    axes[0].bar(
+        [index + 0.2 for index in x],
+        [row["success_rate"] for row in rows],
+        width=0.4,
+        label="exact cell",
+        color="#2f855a",
+    )
+    axes[0].set(title="Full-NLE goal success", ylabel="Rate", ylim=(0, 1))
+    axes[0].legend(frameon=False)
     axes[1].bar(
         [index - 0.2 for index in x],
         [row["mean_best_progress"] for row in rows],

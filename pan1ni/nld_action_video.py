@@ -12,7 +12,7 @@ from PIL import Image, ImageDraw, ImageFont
 from .action import DirectPolicyHead
 from .config import ModelConfig
 from .model import GoalConditionedLeWorldModel
-from .nld_action_train import predictor_features
+from .action import predictor_features
 from .nld_data import NLDTtyrecGoalBatchStream
 from .report import render_terminal
 from .train import move_batch

@@ -38,6 +38,17 @@ RAW_MOVEMENT_KEY_TO_ACTION = {
 }
 
 
+def _pixel_observation(
+    frames: list[np.ndarray], *, history: bool, device: str
+) -> dict[str, torch.Tensor]:
+    """Batch tile crops into a single-example pixel observation for the model."""
+
+    value = torch.from_numpy(np.stack(frames)).movedim(-1, -3).contiguous()
+    if not history:
+        value = value[0]
+    return {"pixels": value.unsqueeze(0).to(device)}
+
+
 def infer_movement_actions(current: np.ndarray, following: np.ndarray) -> np.ndarray:
     """Infer successful one-cell semantic moves from absolute tty cursors."""
 
