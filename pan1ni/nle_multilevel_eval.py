@@ -16,6 +16,8 @@ import argparse
 import json
 import random
 import statistics
+import subprocess
+import tempfile
 from collections import Counter, deque
 from pathlib import Path
 
@@ -25,12 +27,33 @@ import numpy as np
 import torch
 from minihack.tiles.glyph_mapper import GlyphMapper
 from nle import nethack
+from PIL import Image, ImageDraw, ImageFont
 
 from .action import DirectPolicyHead, feature_dim, predictor_features
 from .config import ModelConfig
+from .minihack_report import _render_frame
 from .model import GoalConditionedLeWorldModel
 from .player_tile_converter import build_canonical_lookup, player_centered_tile_crop
 from .player_tile_data import SEMANTIC_ACTION_NAMES, _pixel_observation
+
+
+def _compose(current, goal, *, step, level, action_name, confidence, distance, feature):
+    left = _render_frame(current, "Live full-NLE tile observation")
+    right = _render_frame(goal, "Reachable goal frame")
+    margin, header, footer = 16, 60, 84
+    canvas = Image.new("RGB", (left.width + right.width + margin * 3, header + left.height + footer), "#0c0f0d")
+    canvas.paste(left, (margin, header))
+    canvas.paste(right, (left.width + margin * 2, header))
+    draw = ImageDraw.Draw(canvas)
+    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
+    title = ImageFont.truetype(font_path, 17)
+    body = ImageFont.truetype(font_path, 14)
+    draw.text((margin, 12), f"Multi-level closed loop · Dlvl {level}", font=title, fill="#e7ebf2")
+    draw.text((margin, 36), f"feature: {feature}   same tty->tile conversion as human pretraining", font=body, fill="#98a3b5")
+    y = header + left.height + 12
+    draw.text((margin, y), f"step {step:03d}   action {action_name:<10} conf {confidence:5.0%}", font=body, fill="#70d6a5")
+    draw.text((margin, y + 24), f"chebyshev distance to goal: {distance}", font=body, fill="#e7ebf2")
+    return canvas
 
 COMPASS = tuple(nethack.CompassDirection)          # policy actions (indices 0-7)
 CTRL_V, ENTER, ESC, SPACE = 22, 13, 27, 32
@@ -95,6 +118,24 @@ def _passable(ch, r, c) -> bool:
     return 1 <= r <= 21 and 0 <= c < 80 and int(ch[r, c]) not in BLOCK
 
 
+_WALL_DOOR = frozenset(map(ord, "|-+"))
+
+
+def _passable_mask(o):
+    """Which of the eight compass moves are not into a known wall / closed door / edge.
+    Unexplored ' ' is left available so the policy can still search into the fog."""
+
+    ch = o["tty_chars"]
+    r, c = map(int, o["tty_cursor"])
+    mask = []
+    for dr, dc in DELTAS:
+        tr, tc = r + dr, c + dc
+        mask.append(1 <= tr <= 21 and 0 <= tc < 80 and int(ch[tr, tc]) not in _WALL_DOOR)
+    if not any(mask):
+        mask = [True] * 8
+    return mask
+
+
 def _frontiers(ch):
     out = set()
     for r in range(1, 22):
@@ -148,6 +189,7 @@ def _setup_level(env, converter, level, explore_budget):
     o = _teleport(env, o, level)
     if _dlvl(o) != level:
         return None
+    arrival = _pos(o)            # the open upstairs landing cell -> the episode START
     frame = {}
     order = []
     stuck = 0
@@ -166,13 +208,34 @@ def _setup_level(env, converter, level, explore_budget):
         stuck = stuck + 1 if _pos(o) == p else 0
         if stuck > 18 or term or trunc:
             break
-    return (frame, order, o)
+    return (frame, order, arrival, o)
+
+
+def _navigate_to(env, o, target, *, budget=400):
+    """Walk the agent to `target` (a mapped, reachable cell) via BFS, clearing prompts.
+    Returns the observation; caller checks whether the target was actually reached."""
+
+    stuck = 0
+    for _ in range(budget):
+        o = _clear_more(env, o)
+        if _pos(o) == target:
+            break
+        r, c = map(int, o["tty_cursor"])
+        step = _bfs_first_step(o["tty_chars"], r, c, {target})
+        if step is None:
+            break
+        p = _pos(o)
+        o, _, term, trunc, _ = env.step(D2A[(step[0] - r, step[1] - c)])
+        stuck = stuck + 1 if _pos(o) == p else 0
+        if stuck > 12 or term or trunc:
+            break
+    return o
 
 
 @torch.no_grad()
 def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_frame,
                     start_pos, *, max_steps, device, temperature, generator, action_selection,
-                    uniform_rng=None):
+                    uniform_rng=None, video_path=None, level=1, fps=8):
     history = deque(maxlen=model.config.max_context)
     history.extend(converter(o).copy() for _ in range(model.config.max_context))
     positions = [start_pos]
@@ -180,40 +243,71 @@ def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_fram
     best = _cheb(start_pos, goal_pos)
     success = False
     counts = Counter()
-    for step in range(max_steps):
-        o = _clear_more(env, o)
-        current = converter(o)
-        if step:
-            history.append(current)
-        position = _pos(o)
-        best = min(best, _cheb(position, goal_pos))
-        if uniform_rng is not None:
-            action = uniform_rng.randrange(8)
-        else:
-            batch = {
-                "history": _pixel_observation(list(history), history=True, device=device),
-                "goal": _pixel_observation([goal_frame], history=False, device=device),
-            }
-            logits = head(predictor_features(model, batch, feature))[:, :8]
-            probs = (logits / temperature).softmax(-1)
-            if action_selection == "sample":
-                action = int(torch.multinomial(probs, 1, generator=generator).item())
+    frames_dir = tempfile.TemporaryDirectory() if video_path is not None else None
+    try:
+        for step in range(max_steps):
+            o = _clear_more(env, o)
+            current = converter(o)
+            if step:
+                history.append(current)
+            position = _pos(o)
+            best = min(best, _cheb(position, goal_pos))
+            mask = _passable_mask(o)
+            if uniform_rng is not None:
+                choices = [i for i in range(8) if mask[i]]
+                action = uniform_rng.choice(choices)
+                confidence = 1.0 / len(choices)
             else:
-                action = int(probs.argmax(-1).item())
-        counts[action] += 1
-        previous = position
-        o, _, term, trunc, _ = env.step(action)
-        position = _pos(o)
-        positions.append(position)
-        if position == previous:
-            collisions += 1
-        best = min(best, _cheb(position, goal_pos))
-        if position == goal_pos:
-            success = True
-            break
-        if term or trunc:
-            break
-    steps = step + 1
+                batch = {
+                    "history": _pixel_observation(list(history), history=True, device=device),
+                    "goal": _pixel_observation([goal_frame], history=False, device=device),
+                }
+                logits = head(predictor_features(model, batch, feature))[:, :8].clone()
+                blocked = torch.tensor([not m for m in mask], device=logits.device)
+                logits[:, blocked] = float("-inf")
+                probs = (logits / temperature).softmax(-1)
+                if action_selection == "sample":
+                    action = int(torch.multinomial(probs, 1, generator=generator).item())
+                else:
+                    action = int(probs.argmax(-1).item())
+                confidence = float(probs[0, action].item())
+            counts[action] += 1
+            if frames_dir is not None:
+                _compose(current, goal_frame, step=step, level=level,
+                         action_name=SEMANTIC_ACTION_NAMES[action], confidence=confidence,
+                         distance=_cheb(position, goal_pos), feature=feature or "uniform"
+                         ).save(Path(frames_dir.name) / f"f{step:05d}.png")
+            previous = position
+            o, _, term, trunc, _ = env.step(action)
+            position = _pos(o)
+            positions.append(position)
+            if position == previous:
+                collisions += 1
+            best = min(best, _cheb(position, goal_pos))
+            if position == goal_pos:
+                success = True
+                break
+            if term or trunc:
+                break
+        steps = step + 1
+        if frames_dir is not None:
+            try:  # append the final post-move frame so a success shows the agent landing on the goal
+                _compose(converter(o), goal_frame, step=steps, level=level,
+                         action_name="arrived" if success else "end", confidence=1.0,
+                         distance=_cheb(_pos(o), goal_pos), feature=feature or "uniform"
+                         ).save(Path(frames_dir.name) / f"f{steps:05d}.png")
+            except Exception:
+                pass
+            Path(video_path).parent.mkdir(parents=True, exist_ok=True)
+            subprocess.run(
+                ["ffmpeg", "-y", "-loglevel", "error", "-framerate", str(fps),
+                 "-i", str(Path(frames_dir.name) / "f%05d.png"),
+                 "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "20", str(video_path)],
+                check=True,
+            )
+    finally:
+        if frames_dir is not None:
+            frames_dir.cleanup()
     revisits = max(0, len(positions) - len(set(positions)))
     initial = _cheb(start_pos, goal_pos)
     final = _cheb(positions[-1], goal_pos)
@@ -235,7 +329,8 @@ def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_fram
 @torch.no_grad()
 def run(world_checkpoint, action_checkpoint, output, *, episodes, max_steps,
         min_goal_distance, explore_budget, levels, seed, device, action_selection,
-        temperature, uniform_baseline):
+        temperature, uniform_baseline, video_dir=None, num_videos=0,
+        target_distance=None, distance_tol=2):
     world = torch.load(world_checkpoint, map_location=device, weights_only=False)
     model = GoalConditionedLeWorldModel(ModelConfig(**world["config"])).to(device)
     if model.config.observation_mode != "pixels":
@@ -264,32 +359,57 @@ def run(world_checkpoint, action_checkpoint, output, *, episodes, max_steps,
     while len(records) < episodes and attempted < episodes * 40:
         level = levels[len(records) % len(levels)]
         attempted += 1
-        env = _make_env(attempt_seed, max_steps + explore_budget + 64)
+        eseed = attempt_seed
         attempt_seed += 1
         try:
-            setup = _setup_level(env, converter, level, explore_budget)
+            # PASS 1: map the level and choose a goal at the target distance from arrival
+            env = _make_env(eseed, explore_budget + 64)
+            try:
+                setup = _setup_level(env, converter, level, explore_budget)
+            finally:
+                env.close()
             if setup is None:
                 continue
-            frame, order, o = setup
-            start = _pos(o)
-            # farthest reached cell from the current position that we have a frame for
-            goal = max(frame, key=lambda q: _cheb(q, start))
-            if _cheb(goal, start) < min_goal_distance:
+            frame, order, start, _ = setup   # start = open arrival cell
+            if start not in frame:
                 continue
-            gen = torch.Generator(device=device).manual_seed(attempt_seed + 91_117)
-            urng = random.Random(attempt_seed + 5) if uniform_baseline else None
-            rec = _policy_episode(
-                env, o, model, head, feature, converter, goal, frame[goal], start,
-                max_steps=max_steps, device=device, temperature=temperature,
-                generator=gen, action_selection=action_selection, uniform_rng=urng,
-            )
-            rec.update(episode=len(records), seed=attempt_seed - 1, level=level,
+            if target_distance is not None:
+                goal = min(frame, key=lambda q: abs(_cheb(q, start) - target_distance))
+                if abs(_cheb(goal, start) - target_distance) > distance_tol:
+                    continue
+            else:
+                goal = max(frame, key=lambda q: _cheb(q, start))
+                if _cheb(goal, start) < min_goal_distance:
+                    continue
+            # PASS 2: fresh env, same seed -> same level + same arrival; run policy from arrival
+            env = _make_env(eseed, max_steps + 64)
+            try:
+                o, _ = env.reset()
+                o = _teleport(env, o, level)
+                o = _clear_more(env, o)
+                if _dlvl(o) != level or _pos(o) != start:
+                    continue
+                gen = torch.Generator(device=device).manual_seed(eseed + 91_117)
+                urng = random.Random(eseed + 5) if uniform_baseline else None
+                vpath = None
+                if video_dir and len(records) < num_videos:
+                    vpath = Path(video_dir) / f"ep{len(records):02d}-Dlvl{level}-d{_cheb(goal, start)}.mp4"
+                rec = _policy_episode(
+                    env, o, model, head, feature, converter, goal, frame[goal], start,
+                    max_steps=max_steps, device=device, temperature=temperature,
+                    generator=gen, action_selection=action_selection, uniform_rng=urng,
+                    video_path=vpath, level=level,
+                )
+            finally:
+                env.close()
+            rec.update(episode=len(records), seed=eseed, level=level,
                        goal_distance=_cheb(goal, start))
             records.append(rec)
             print(f"ep {len(records):3d}/{episodes} | Dlvl {level} | dist {rec['goal_distance']:2d} | "
                   f"success {rec['success']} | best {rec['best_distance']}", flush=True)
-        finally:
-            env.close()
+        except Exception as exc:  # NetHack states occasionally break the tile crop; skip that attempt
+            print(f"  attempt {attempted} (Dlvl {level}) skipped: {type(exc).__name__}: {exc}", flush=True)
+            continue
 
     def near(rs): return sum(r["best_distance"] <= 1 for r in rs) / max(len(rs), 1)
     successes = [r for r in records if r["success"]]
@@ -329,6 +449,8 @@ def main():
     p.add_argument("--action-selection", choices=("argmax", "sample"), default="sample")
     p.add_argument("--temperature", type=float, default=1.0)
     p.add_argument("--uniform-baseline", action="store_true")
+    p.add_argument("--video-dir", type=Path)
+    p.add_argument("--num-videos", type=int, default=0)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = p.parse_args()
     if not a.uniform_baseline and a.action_checkpoint is None:
@@ -337,7 +459,7 @@ def main():
               max_steps=a.max_steps, min_goal_distance=a.min_goal_distance,
               explore_budget=a.explore_budget, levels=a.levels, seed=a.seed, device=a.device,
               action_selection=a.action_selection, temperature=a.temperature,
-              uniform_baseline=a.uniform_baseline))
+              uniform_baseline=a.uniform_baseline, video_dir=a.video_dir, num_videos=a.num_videos))
 
 
 if __name__ == "__main__":

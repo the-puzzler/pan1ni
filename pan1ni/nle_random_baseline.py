@@ -8,6 +8,7 @@ from collections import Counter
 from pathlib import Path
 
 from .nle_closed_loop_eval import (
+    MOVEMENT_DELTAS,
     TileConverter,
     _distance,
     _make_env,
@@ -15,6 +16,19 @@ from .nle_closed_loop_eval import (
     _verify_same_reset,
     collect_reference_goal,
 )
+
+_MASK_BLOCKED = frozenset(map(ord, "|-+"))
+
+
+def _passable_dirs(observation):
+    ch = observation["tty_chars"]
+    r, c = map(int, observation["tty_cursor"])
+    dirs = []
+    for i, (dr, dc) in enumerate(MOVEMENT_DELTAS):
+        tr, tc = r + dr, c + dc
+        if 1 <= tr <= 21 and 0 <= tc < 80 and int(ch[tr, tc]) not in _MASK_BLOCKED:
+            dirs.append(i)
+    return dirs or list(range(8))
 
 
 def run(
@@ -28,6 +42,7 @@ def run(
     seed: int,
     max_goal_distance: int = 1_000_000,
     goal_distance_mode: str = "mixed",
+    masked: bool = False,
 ) -> Path:
     converter = TileConverter.create()
     references = []
@@ -66,7 +81,7 @@ def run(
             best_distance = reference.initial_distance
             terminated = truncated = success = False
             for step in range(max_steps):
-                action = rng.randrange(8)
+                action = rng.choice(_passable_dirs(observation)) if masked else rng.randrange(8)
                 counts[action] += 1
                 previous = _position(observation)
                 observation, _, terminated, truncated, _ = env.step(action)
@@ -123,7 +138,7 @@ def run(
         "environment": env_id,
         "representation": "full NLE tty converted by the human-pretraining tile pipeline",
         "spawn_monsters": False,
-        "feature": "uniform_random",
+        "feature": "uniform_random_masked" if masked else "uniform_random",
         "action_policy": "uniform random over eight semantic movement classes",
         "goal_distance_mode": goal_distance_mode,
         "min_goal_distance": min_goal_distance,
@@ -160,6 +175,7 @@ def main() -> None:
     parser.add_argument("--min-goal-distance", type=int, default=3)
     parser.add_argument("--max-goal-distance", type=int, default=1_000_000)
     parser.add_argument("--goal-distance-mode", default="mixed")
+    parser.add_argument("--masked", action="store_true")
     parser.add_argument("--seed", type=int, default=12345)
     args = parser.parse_args()
     print(
@@ -173,6 +189,7 @@ def main() -> None:
             seed=args.seed,
             max_goal_distance=args.max_goal_distance,
             goal_distance_mode=args.goal_distance_mode,
+            masked=args.masked,
         )
     )
 
