@@ -9,16 +9,16 @@ import torch
 from torch import nn
 from torch.utils.data import DataLoader
 
-from pan1ni.action import DirectPolicyHead, InverseDynamicsHead
-from pan1ni.config import ModelConfig
-from pan1ni.data import GoalWindowDataset
-from pan1ni.losses import sigreg
-from pan1ni.model import GoalConditionedLeWorldModel, TerminalRGBPixelViT
-from pan1ni.minihack_data import MiniHackPixelGoalDataset
-from pan1ni.nld_data import NLDHDF5GoalDataset
-from pan1ni.nld_ttyrec_train import nld_model_config
-from pan1ni.synthetic import make_goal_directed_trajectories, make_synthetic_trajectories
-from pan1ni.train import action_step, label_subset_indices, pretrain_step
+from pan1ni.models.action import DirectPolicyHead, InverseDynamicsHead
+from pan1ni.models.config import ModelConfig
+from pan1ni.data.windows import GoalWindowDataset
+from pan1ni.models.losses import sigreg
+from pan1ni.models.model import GoalConditionedLeWorldModel, TerminalRGBPixelViT
+from pan1ni.data.minihack import MiniHackPixelGoalDataset
+from pan1ni.data.nld import NLDHDF5GoalDataset
+from pan1ni.training.ttyrec_train import nld_model_config
+from pan1ni.data.synthetic import make_goal_directed_trajectories, make_synthetic_trajectories
+from pan1ni.training.primitives import action_step, label_subset_indices, pretrain_step
 
 
 class CoreTests(unittest.TestCase):

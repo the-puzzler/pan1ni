@@ -18,22 +18,22 @@ import matplotlib.pyplot as plt
 import torch
 from torch.nn import functional as F
 
-from .action import (
+from pan1ni.models.action import (
     GOAL_AWARE_FEATURES,
     DirectPolicyHead,
     feature_dim,
     predictor_features,
     set_backbone_trainable,
 )
-from .config import ModelConfig
-from .model import GoalConditionedLeWorldModel
-from .nld_data import prefetch_batches
-from .player_tile_data import (
+from pan1ni.models.config import ModelConfig
+from pan1ni.models.model import GoalConditionedLeWorldModel
+from pan1ni.data.nld import prefetch_batches
+from pan1ni.data.tile_stream import (
     SEMANTIC_ACTION_NAMES,
     SEMANTIC_STAIRS_ACTION_NAMES,
     NLDPlayerTileGoalBatchStream,
 )
-from .train import move_batch
+from pan1ni.training.primitives import move_batch
 
 # Action sets: name -> (num_classes, stream action_mode, class names).
 ACTION_SETS = {

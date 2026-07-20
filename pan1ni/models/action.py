@@ -6,7 +6,7 @@ import torch
 from torch import Tensor, nn
 
 if TYPE_CHECKING:
-    from .model import GoalConditionedLeWorldModel
+    from pan1ni.models.model import GoalConditionedLeWorldModel
 
 
 ACTION_FEATURES = (

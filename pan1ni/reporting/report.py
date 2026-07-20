@@ -18,10 +18,10 @@ from torch import Tensor
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from .config import ModelConfig
-from .model import GoalConditionedLeWorldModel
-from .nld_data import NLDHDF5GoalDataset, nld_episode_keys
-from .train import move_batch, pretrain_step
+from pan1ni.models.config import ModelConfig
+from pan1ni.models.model import GoalConditionedLeWorldModel
+from pan1ni.data.nld import NLDHDF5GoalDataset, nld_episode_keys
+from pan1ni.training.primitives import move_batch, pretrain_step
 
 NLE_COLORS = (
     "#111318", "#b94a48", "#5cab63", "#b58b45", "#6577c8", "#a960b8", "#55a7ac", "#c8ccd4",

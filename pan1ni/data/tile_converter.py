@@ -16,7 +16,7 @@ from minihack.tiles.glyph_mapper import GlyphMapper
 from nle import nethack
 from PIL import Image, ImageDraw, ImageFont
 
-from .minihack_data import (
+from pan1ni.data.minihack import (
     GOAL_POSITIONS,
     KEY_POSITIONS,
     KeyRoomOracle,

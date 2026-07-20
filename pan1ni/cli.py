@@ -9,12 +9,12 @@ import torch
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from .config import ModelConfig
-from .data import GoalWindowDataset
-from .model import GoalConditionedLeWorldModel
-from .nld_data import NLDHDF5GoalDataset, nld_episode_keys
-from .synthetic import make_goal_directed_trajectories
-from .train import move_batch, pretrain_step
+from pan1ni.models.config import ModelConfig
+from pan1ni.data.windows import GoalWindowDataset
+from pan1ni.models.model import GoalConditionedLeWorldModel
+from pan1ni.data.nld import NLDHDF5GoalDataset, nld_episode_keys
+from pan1ni.data.synthetic import make_goal_directed_trajectories
+from pan1ni.training.primitives import move_batch, pretrain_step
 
 
 @torch.no_grad()

@@ -7,7 +7,7 @@ from PIL import Image, ImageDraw, ImageFont
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .config import ModelConfig
+from pan1ni.models.config import ModelConfig
 
 
 class Prediction(NamedTuple):

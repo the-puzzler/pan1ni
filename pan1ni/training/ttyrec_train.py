@@ -8,11 +8,11 @@ from pathlib import Path
 
 import torch
 
-from .config import ModelConfig
-from .model import GoalConditionedLeWorldModel
-from .nld_data import NLDTtyrecGoalBatchStream, prefetch_streams
-from .report import diagnose, report_model_config
-from .train import move_batch, pretrain_step
+from pan1ni.models.config import ModelConfig
+from pan1ni.models.model import GoalConditionedLeWorldModel
+from pan1ni.data.nld import NLDTtyrecGoalBatchStream, prefetch_streams
+from pan1ni.reporting.report import diagnose, report_model_config
+from pan1ni.training.primitives import move_batch, pretrain_step
 
 
 def _save_checkpoint(

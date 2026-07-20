@@ -6,9 +6,9 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from .action import DirectPolicyHead, InverseDynamicsHead
-from .losses import pretraining_loss
-from .model import GoalConditionedLeWorldModel
+from pan1ni.models.action import DirectPolicyHead, InverseDynamicsHead
+from pan1ni.models.losses import pretraining_loss
+from pan1ni.models.model import GoalConditionedLeWorldModel
 
 Batch = Mapping[str, Tensor | Mapping[str, Tensor]]
 

@@ -29,12 +29,12 @@ from minihack.tiles.glyph_mapper import GlyphMapper
 from nle import nethack
 from PIL import Image, ImageDraw, ImageFont
 
-from .action import DirectPolicyHead, feature_dim, predictor_features
-from .config import ModelConfig
-from .minihack_report import _render_frame
-from .model import GoalConditionedLeWorldModel
-from .player_tile_converter import build_canonical_lookup, player_centered_tile_crop
-from .player_tile_data import SEMANTIC_ACTION_NAMES, _pixel_observation
+from pan1ni.models.action import DirectPolicyHead, feature_dim, predictor_features
+from pan1ni.models.config import ModelConfig
+from pan1ni.reporting.tiled import _render_frame
+from pan1ni.models.model import GoalConditionedLeWorldModel
+from pan1ni.data.tile_converter import build_canonical_lookup, player_centered_tile_crop
+from pan1ni.data.tile_stream import SEMANTIC_ACTION_NAMES, _pixel_observation
 
 
 COMBAT_KW = ("You hit", "You miss", "You kill", "You destroy", "You swing",

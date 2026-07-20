@@ -14,11 +14,11 @@ import torch
 from PIL import Image, ImageDraw, ImageFont
 from torch.utils.data import DataLoader
 
-from .config import ModelConfig
-from .minihack_data import MiniHackPixelGoalDataset
-from .model import GoalConditionedLeWorldModel
-from .report import _svg_chart, diagnose
-from .train import move_batch, pretrain_step
+from pan1ni.models.config import ModelConfig
+from pan1ni.data.minihack import MiniHackPixelGoalDataset
+from pan1ni.models.model import GoalConditionedLeWorldModel
+from pan1ni.reporting.report import _svg_chart, diagnose
+from pan1ni.training.primitives import move_batch, pretrain_step
 
 STAGE_NAMES = {0: "find key", 1: "reach locked door", 2: "enter goal room", 3: "reach staircase"}
 

@@ -12,14 +12,14 @@ import torch
 from minihack.tiles.glyph_mapper import GlyphMapper
 from torch.utils.data import DataLoader
 
-from .config import ModelConfig
-from .minihack_data import MiniHackPixelGoalDataset
-from .model import GoalConditionedLeWorldModel
-from .nld_data import prefetch_batches
-from .player_tile_converter import build_canonical_lookup
-from .player_tile_data import NLDPlayerTileGoalBatchStream
-from .report import diagnose
-from .train import move_batch, pretrain_step
+from pan1ni.models.config import ModelConfig
+from pan1ni.data.minihack import MiniHackPixelGoalDataset
+from pan1ni.models.model import GoalConditionedLeWorldModel
+from pan1ni.data.nld import prefetch_batches
+from pan1ni.data.tile_converter import build_canonical_lookup
+from pan1ni.data.tile_stream import NLDPlayerTileGoalBatchStream
+from pan1ni.reporting.report import diagnose
+from pan1ni.training.primitives import move_batch, pretrain_step
 
 
 def pixel_model_config(objective: str = "flow") -> ModelConfig:

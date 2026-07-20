@@ -1,155 +1,129 @@
-# Goal-conditioned LeWorldModel for NetHack
+# Goal-conditioned world model for NetHack
 
-This repository is a runnable research scaffold for testing whether **action-free,
-goal-conditioned predictive pretraining** improves the label efficiency of NetHack
-action prediction. It supports both NLE's structured terminal observations and
-MiniHack's tiled RGB observations.
+Action-free, goal-conditioned predictive pretraining for NetHack. A latent world
+model is pretrained **only on recordings of humans playing NetHack** (the NLD-NAO
+ttyrec corpus) — with no actions, rewards, or task objective — then a small frozen
+head reads its latents and navigates to arbitrary goals.
 
-Given a short history and the final observation of that episode, the model learns
+**Headline result.** With the backbone frozen and only a lightweight inverse-dynamics
+(IDM) head trained on movement labels inferred from the human data, the model
+navigates to goals across unseen, procedurally-generated dungeon levels at
+**64–80% success from 3 to 30 tiles away — essentially flat with distance** — while a
+masked random walk on identical setups collapses to **0% beyond ~10 tiles**. Flat
+success-vs-distance is the signature of goal-*following* rather than search, from a
+model that only ever watched humans play.
+
+| goal distance (tiles) | IDM policy (exact %) | masked random (exact %) |
+|--:|:--|:--|
+| 3 | 64 | 71 |
+| 6 | 64 | 29 |
+| 10 | 64 | 0 |
+| 14 | 67 | 8 |
+| 20 | 67 | 0 |
+| 25 | 75 | 0 |
+| 30 | 80 | 0 |
+
+## Method
+
+Given a short history and the final observation of an episode, the model learns
 
 ```text
 goal_z = E(o[T-1])
 E(o[t-K+1:t]), goal_z -> predicted E(o[t+1])
 ```
 
-with end-to-end latent MSE plus SIGReg. SIGReg is implemented as the sliced
-Epps–Pulley normality statistic used to push projected embeddings toward an isotropic
-Gaussian. No contrastive loss, reconstruction decoder, EMA encoder, or online RL is
-included.
+with an end-to-end latent MSE objective plus **SIGReg** — the sliced Epps–Pulley
+normality statistic that pushes projected embeddings toward an isotropic Gaussian.
+No contrastive loss, reconstruction decoder, EMA encoder, or online RL. Observations
+are human tty frames tile-rendered into the MiniHack 16×16 atlas as a 9×9
+player-centred crop (144×144 RGB). The predictor is a goal-conditioned causal
+transformer over an 8-frame context; the IDM control feature is
+`[current_latent, predicted_next, predicted_next − current]`.
 
-## What is implemented
+## Pipeline
 
-- Small in-repo ViT over embedded terminal-cell patches, with message, status
-  (`blstats`), and cursor data supplied as a metadata token.
-- A standard tiny patch ViT for MiniHack's 144×144 tiled RGB crop.
-- CLS projection through `Linear -> BatchNorm1d -> GELU -> Linear`; all temporal
-  views are projected jointly so BatchNorm sees the same batch × views layout as
-  the LeJEPA demo.
-- Transformer predictor with 8–32-step temporal contexts and an explicit `goal_z`
-  token produced by embedding the episode's final frame.
-- A single goal-conditioned prediction path: history plus that fixed final-frame goal.
-- SIGReg and end-to-end pretraining step.
-- Inverse-dynamics `p(a_t | z_t, z_hat[t+1])` and direct-policy heads.
-- Frozen-backbone or full-finetuning action training.
-- Horizon-stratified MSE and nested reproducible label subsets.
-- Goal-directed synthetic navigation where the final position causally determines
-  each next movement, for fast end-to-end validation without NLE/NLD.
+1. **Pretrain** the tile-pixel world model on human NLD-NAO ttyrecs — `training/pretrain.py`.
+2. **Train the IDM head** (8 movement classes) on movement labels inferred from tty
+   cursor deltas, backbone frozen — `training/action_train.py`.
+3. **Evaluate** closed-loop, cross-level goal navigation in full NetHack via wizard
+   teleport + frontier-BFS goal selection, with a matched masked-random baseline —
+   `eval/multilevel.py`.
 
-## Run the smoke experiment
+Trained checkpoints, evaluation JSON, curves, and showcase videos are written under
+`reports/` (git-ignored; regenerate with the commands below).
+
+## Quick start
 
 ```bash
 uv sync
-uv run pan1ni smoke --steps 200 --batch-size 32 --sigreg-slices 256
-uv run python -m unittest discover -s tests -v
+uv run pan1ni smoke --steps 200 --batch-size 32 --sigreg-slices 256   # plumbing check
+uv run python -m unittest discover -s tests -v                        # test suite
 ```
 
-The smoke command performs real forward/backward updates and prints the prediction,
-SIGReg, and total pretraining losses. It is a plumbing check, not evidence for the
-research hypothesis.
+The smoke command runs real forward/backward updates and prints the prediction,
+SIGReg, and total pretraining losses. Its synthetic task uses a one-frame context so
+the predictor must choose the next move from the current embedding and `goal_z`
+alone — no previous action is in the input.
 
-The synthetic smoke task deliberately uses a one-frame context. Its predictor must
-choose the next grid movement from the current embedding and the final-frame
-`goal_z`; no previous movement direction is present in the input.
+## Data
 
-## Connecting NLD
-
-NLD is intentionally an optional data source because its installation and storage are
-environment-specific. Convert an episode returned by your NLD loader with:
+NLD is an optional, environment-specific data source. Convert an episode from your
+NLD loader into training windows:
 
 ```python
-from pan1ni.data import GoalWindowDataset, trajectory_from_nle
+from pan1ni.data.windows import GoalWindowDataset, trajectory_from_nle
 
 trajectory = trajectory_from_nle(
-    {
-        "tty_chars": episode["tty_chars"],
-        "tty_colors": episode["tty_colors"],
-        "tty_cursor": episode["tty_cursor"],
-        "message": episode["message"],
-        "blstats": episode["blstats"],
-        # optional: "tty_bg_colors"
-    },
+    {k: episode[k] for k in ("tty_chars", "tty_colors", "tty_cursor", "message", "blstats")},
     actions=episode.get("actions"),
 )
-
-windows = GoalWindowDataset(
-    [trajectory],
-    context_length=8,
-)
+windows = GoalWindowDataset([trajectory], context_length=8)
 ```
 
-`Trajectory` is deliberately tensor-only, so an NLD/TorchBeast/HDF5 reader can feed
-it without coupling model code to a particular dataset release. Split episodes—not
-windows—into train/validation/test sets to avoid leakage.
-
-### Local NLD-AA taster
-
-The repository can also stream the compact NLD-AA HDF5 mirror directly, without
-loading full episodes into memory. The checked file contains 45 AutoAscend episodes
-and 1,592,977 transitions:
+`Trajectory` is tensor-only, so any NLD/TorchBeast/HDF5 reader can feed it. Split
+episodes — not windows — into train/val/test to avoid leakage. A compact NLD-AA HDF5
+mirror can be streamed directly for a taster run:
 
 ```bash
-mkdir -p data/downloads
-curl -L -o data/downloads/nld-aa-taster.hdf5 \
-  https://huggingface.co/datasets/Howuhh/nld-aa-taster/resolve/main/data/data-cav-gno-neu-any.hdf5
-sha256sum data/downloads/nld-aa-taster.hdf5
-# dd404b6214a6c282a9f4e81b1acbfd353fdade505f09d1554093f6edce4b364b
-
-uv run pan1ni nld-smoke \
-  --steps 100 \
-  --batch-size 4 \
-  --sigreg-slices 256 \
-  --goal-horizon 64
+uv run pan1ni nld-smoke --steps 100 --batch-size 4 --sigreg-slices 256 --goal-horizon 64
 ```
 
-`NLDHDF5GoalDataset` performs an episode-level split and samples `t`, `t+1`, and
-`t+goal_horizon` lazily. The last of those frames is the final frame of the sampled
-sequence and becomes `goal_z`. This mirror contains terminal characters, colours,
-cursor, actions, rewards, and done flags. Until raw ttyrec loading is enabled, the
-message modality is copied from terminal row zero and the unavailable `blstats`
-modality is zero-filled.
+## Browser demo
 
-## Tiled MiniHack KeyRoom experiment
-
-For the visually inspectable causal test, the repository defines 16 explicit
-MiniHack layouts with varying key and goal positions. Every successful trajectory
-requires the chain `find key -> unlock central door -> approach goal staircase`.
-The post-termination NetHack buffer is excluded because it is not a valid gameplay
-image.
+An interactive, fully in-browser demo (the model navigating real levels via ONNX
+Runtime Web) is generated by `scripts/export_browser_levels.py` and shipped as a
+self-contained folder outside this repo. Regenerate it with a trained checkpoint:
 
 ```bash
-uv run python -m pan1ni.minihack_data --episodes 1600
-uv run python -m pan1ni.minihack_report \
-  --steps 1000 \
-  --batch-size 32 \
-  --validation-samples 128
+uv run python scripts/export_browser_levels.py --need 4 --out nethack-navigator
+# then: cd nethack-navigator && python3 serve.py
 ```
 
-The report includes correct/shuffled/zero-goal controls, the copy-current baseline,
-latent variance and effective rank, stage-stratified errors, tiled screenshots, and
-an H.264 trajectory video. The pixel encoder retains the same
-`CLS -> BatchNorm MLP -> z` projector required by SIGReg.
+## Repository layout
 
-## Current experiment scope
-
-The code currently trains only the goal-conditioned world model. Every pretraining
-sample contains a history, the episode's final frame as its goal, and the immediate
-next observation as its prediction target. The goal distance is therefore determined
-by the sampled current timestep rather than sampled independently.
-
-For each checkpoint, train both action heads on nested label fractions
-`0.001, 0.01, 0.1, 1.0`, first with the backbone frozen and then with full fine-tuning.
-Report mean and uncertainty over seeds, top-1 action accuracy/cross-entropy, and
-metrics grouped by goal offset. Contrastive objectives and baseline/control variants
-are intentionally deferred.
-
-## Package map
-
-- `pan1ni/data.py`: NLE adapter, episode filtering, and window sampling
-- `pan1ni/nld_data.py`: lazy HDF5 NLD sequence sampler
-- `pan1ni/minihack_data.py`: tiled KeyRoom environments, oracle collector, and HDF5 sampler
-- `pan1ni/model.py`: terminal/pixel ViT encoders and goal-conditioned predictor
-- `pan1ni/minihack_report.py`: tiled training diagnostics and HTML/video report
-- `pan1ni/losses.py`: SIGReg and pretraining objective
-- `pan1ni/action.py`: downstream action heads and freezing utility
-- `pan1ni/train.py`: training and evaluation primitives
-- `pan1ni/synthetic.py`: dependency-free synthetic episodes
+```
+pan1ni/
+  cli.py                     command-line entry (smoke / nld-smoke)
+  models/
+    model.py                 terminal + tile-pixel ViT encoders, goal-conditioned predictor
+    config.py  losses.py      model config; SIGReg + pretraining objective
+    action.py                action-head features (incl. IDM) and backbone freezing
+  data/
+    windows.py               NLE adapter, episode filtering, window sampling
+    nld.py                   lazy HDF5 NLD sequence sampler
+    minihack.py              tiled KeyRoom envs + oracle (tile-atlas calibration)
+    tile_converter.py        tty -> canonical MiniHack tile crop
+    tile_stream.py           human-ttyrec tile/goal streaming + action inference
+    synthetic.py             dependency-free synthetic navigation task
+  training/
+    primitives.py            train/eval step primitives, label subsets
+    pretrain.py              world-model pretraining (tile pixels)
+    action_train.py          frozen-backbone IDM / movement head training
+    ttyrec_train.py          structured-observation trainer + config
+  eval/
+    multilevel.py            cross-level closed-loop navigation eval + random baseline
+  reporting/
+    report.py  tiled.py       training diagnostics, frames, HTML/video reports
+scripts/export_browser_levels.py   export the browser demo from a checkpoint
+tests/                             unit tests
+```

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from .data import Trajectory
+from pan1ni.data.windows import Trajectory
 
 
 def make_synthetic_trajectories(

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from minihack.tiles.glyph_mapper import GlyphMapper
 
-from .player_tile_converter import (
+from pan1ni.data.tile_converter import (
     batch_player_centered_tile_crops,
     build_canonical_lookup,
 )
