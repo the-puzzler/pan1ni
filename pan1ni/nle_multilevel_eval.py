@@ -37,10 +37,18 @@ from .player_tile_converter import build_canonical_lookup, player_centered_tile_
 from .player_tile_data import SEMANTIC_ACTION_NAMES, _pixel_observation
 
 
-def _compose(current, goal, *, step, level, action_name, confidence, distance, feature):
+COMBAT_KW = ("You hit", "You miss", "You kill", "You destroy", "You swing",
+             "You bite", "You attack", "You smite", "You force")
+
+
+def _is_attack(message: str) -> bool:
+    return any(k in message for k in COMBAT_KW)
+
+
+def _compose(current, goal, *, step, level, action_name, confidence, distance, feature, message=""):
     left = _render_frame(current, "Live full-NLE tile observation")
     right = _render_frame(goal, "Reachable goal frame")
-    margin, header, footer = 16, 60, 84
+    margin, header, footer = 16, 60, 108
     canvas = Image.new("RGB", (left.width + right.width + margin * 3, header + left.height + footer), "#0c0f0d")
     canvas.paste(left, (margin, header))
     canvas.paste(right, (left.width + margin * 2, header))
@@ -53,6 +61,9 @@ def _compose(current, goal, *, step, level, action_name, confidence, distance, f
     y = header + left.height + 12
     draw.text((margin, y), f"step {step:03d}   action {action_name:<10} conf {confidence:5.0%}", font=body, fill="#70d6a5")
     draw.text((margin, y + 24), f"chebyshev distance to goal: {distance}", font=body, fill="#e7ebf2")
+    if message:
+        draw.text((margin, y + 48), message[:72], font=body,
+                  fill="#ff6b6b" if _is_attack(message) else "#98a3b5")
     return canvas
 
 COMPASS = tuple(nethack.CompassDirection)          # policy actions (indices 0-7)
@@ -64,7 +75,7 @@ D2A = {delta: index for index, delta in enumerate(DELTAS)}
 BLOCK = frozenset(map(ord, "|-+ "))                # walls, closed doors, unknown
 
 
-def _make_env(seed: int, max_steps: int):
+def _make_env(seed: int, max_steps: int, spawn_monsters: bool = False):
     env = gym.make(
         "NetHackScore-v0",
         wizard=True,
@@ -73,7 +84,7 @@ def _make_env(seed: int, max_steps: int):
         actions=SETUP_ACTIONS,
         observation_keys=("tty_chars", "tty_colors", "tty_cursor", "blstats", "message"),
         max_episode_steps=max_steps,
-        spawn_monsters=False,
+        spawn_monsters=spawn_monsters,
     )
     env.unwrapped.seed(core=seed, disp=seed, reseed=True)
     return env
@@ -240,6 +251,7 @@ def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_fram
     history.extend(converter(o).copy() for _ in range(model.config.max_context))
     positions = [start_pos]
     collisions = 0
+    attacks = 0
     best = _cheb(start_pos, goal_pos)
     success = False
     counts = Counter()
@@ -248,6 +260,7 @@ def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_fram
         for step in range(max_steps):
             o = _clear_more(env, o)
             current = converter(o)
+            game_msg = _msg(o).strip()
             if step:
                 history.append(current)
             position = _pos(o)
@@ -275,10 +288,13 @@ def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_fram
             if frames_dir is not None:
                 _compose(current, goal_frame, step=step, level=level,
                          action_name=SEMANTIC_ACTION_NAMES[action], confidence=confidence,
-                         distance=_cheb(position, goal_pos), feature=feature or "uniform"
+                         distance=_cheb(position, goal_pos), feature=feature or "uniform",
+                         message=game_msg
                          ).save(Path(frames_dir.name) / f"f{step:05d}.png")
             previous = position
             o, _, term, trunc, _ = env.step(action)
+            if _is_attack(_msg(o).strip()):
+                attacks += 1
             position = _pos(o)
             positions.append(position)
             if position == previous:
@@ -294,7 +310,8 @@ def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_fram
             try:  # append the final post-move frame so a success shows the agent landing on the goal
                 _compose(converter(o), goal_frame, step=steps, level=level,
                          action_name="arrived" if success else "end", confidence=1.0,
-                         distance=_cheb(_pos(o), goal_pos), feature=feature or "uniform"
+                         distance=_cheb(_pos(o), goal_pos), feature=feature or "uniform",
+                         message=_msg(o).strip()
                          ).save(Path(frames_dir.name) / f"f{steps:05d}.png")
             except Exception:
                 pass
@@ -323,6 +340,7 @@ def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_fram
         "revisit_rate": revisits / max(len(positions) - 1, 1),
         "collisions": collisions,
         "collision_rate": collisions / max(steps, 1),
+        "attacks": attacks,
     }
 
 
@@ -330,7 +348,7 @@ def _policy_episode(env, o, model, head, feature, converter, goal_pos, goal_fram
 def run(world_checkpoint, action_checkpoint, output, *, episodes, max_steps,
         min_goal_distance, explore_budget, levels, seed, device, action_selection,
         temperature, uniform_baseline, video_dir=None, num_videos=0,
-        target_distance=None, distance_tol=2):
+        target_distance=None, distance_tol=2, spawn_monsters=False):
     world = torch.load(world_checkpoint, map_location=device, weights_only=False)
     model = GoalConditionedLeWorldModel(ModelConfig(**world["config"])).to(device)
     if model.config.observation_mode != "pixels":
@@ -382,7 +400,7 @@ def run(world_checkpoint, action_checkpoint, output, *, episodes, max_steps,
                 if _cheb(goal, start) < min_goal_distance:
                     continue
             # PASS 2: fresh env, same seed -> same level + same arrival; run policy from arrival
-            env = _make_env(eseed, max_steps + 64)
+            env = _make_env(eseed, max_steps + 64, spawn_monsters=spawn_monsters)
             try:
                 o, _ = env.reset()
                 o = _teleport(env, o, level)
@@ -406,7 +424,7 @@ def run(world_checkpoint, action_checkpoint, output, *, episodes, max_steps,
                        goal_distance=_cheb(goal, start))
             records.append(rec)
             print(f"ep {len(records):3d}/{episodes} | Dlvl {level} | dist {rec['goal_distance']:2d} | "
-                  f"success {rec['success']} | best {rec['best_distance']}", flush=True)
+                  f"success {rec['success']} | best {rec['best_distance']} | atk {rec.get('attacks', 0)}", flush=True)
         except Exception as exc:  # NetHack states occasionally break the tile crop; skip that attempt
             print(f"  attempt {attempted} (Dlvl {level}) skipped: {type(exc).__name__}: {exc}", flush=True)
             continue
@@ -427,6 +445,9 @@ def run(world_checkpoint, action_checkpoint, output, *, episodes, max_steps,
         "mean_goal_distance": statistics.mean(r["goal_distance"] for r in records) if records else None,
         "level_distribution": dict(Counter(r["level"] for r in records)),
         "collision_rate": statistics.mean(r["collision_rate"] for r in records) if records else None,
+        "total_attacks": sum(r.get("attacks", 0) for r in records),
+        "episodes_with_attacks": sum(1 for r in records if r.get("attacks", 0) > 0),
+        "spawn_monsters": bool(spawn_monsters),
         "attempts": attempted,
         "records": records,
     }
@@ -451,6 +472,9 @@ def main():
     p.add_argument("--uniform-baseline", action="store_true")
     p.add_argument("--video-dir", type=Path)
     p.add_argument("--num-videos", type=int, default=0)
+    p.add_argument("--target-distance", type=int)
+    p.add_argument("--distance-tol", type=int, default=2)
+    p.add_argument("--spawn-monsters", action="store_true")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     a = p.parse_args()
     if not a.uniform_baseline and a.action_checkpoint is None:
@@ -459,7 +483,9 @@ def main():
               max_steps=a.max_steps, min_goal_distance=a.min_goal_distance,
               explore_budget=a.explore_budget, levels=a.levels, seed=a.seed, device=a.device,
               action_selection=a.action_selection, temperature=a.temperature,
-              uniform_baseline=a.uniform_baseline, video_dir=a.video_dir, num_videos=a.num_videos))
+              uniform_baseline=a.uniform_baseline, video_dir=a.video_dir, num_videos=a.num_videos,
+              target_distance=a.target_distance, distance_tol=a.distance_tol,
+              spawn_monsters=a.spawn_monsters))
 
 
 if __name__ == "__main__":
